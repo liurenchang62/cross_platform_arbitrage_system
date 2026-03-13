@@ -109,24 +109,12 @@ impl EventMatcher {
         let mut items_to_add = Vec::new();
         let mut category_count: HashMap<String, usize> = HashMap::new();
         
-        // ==== 调试2: 记录前20个事件的event_id，看进入索引的是哪些 ====
-        let mut index_count = 0;
-        // ==== 结束调试2 ====
+        
         
         for event in events {
             if let Some(vector) = self.vectorizer.transform(&event.title) {
                 let categories = self.category_mapper.classify(&event.title);
                 
-                // ==== 调试2续: 输出前20个进入索引的事件 ====
-                if index_count < 20 {
-                    println!("📊 [构建索引] event_id={}, 类别={:?}, 标题={}", 
-                        event.event_id,
-                        categories,
-                        event.title.chars().take(30).collect::<String>()
-                    );
-                    index_count += 1;
-                }
-                // ==== 结束调试2续 ====
                 
                 for cat in &categories {
                     *category_count.entry(cat.clone()).or_insert(0) += 1;
@@ -146,7 +134,7 @@ impl EventMatcher {
             }
         }
 
-        println!("   📊 生成 {} 个待添加项", items_to_add.len());
+        
         self.kalshi_index.add_events_batch(items_to_add)?;
         self.fitted = true;
         
@@ -245,14 +233,11 @@ impl EventMatcher {
             let pair_key = format!("{}:{}", e1.event_id, e2.event_id);
             let reverse_key = format!("{}:{}", e2.event_id, e1.event_id);
             
-            // 确保没出现过，也没出现过反向的
             if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
                 seen_pairs.insert(pair_key);
-                // 确保顺序是 (PM, Kalshi)
                 if e1.platform == "polymarket" && e2.platform == "kalshi" {
                     all_matches.push((e1, e2, score));
                 } else {
-                    // 如果顺序反了，交换回来
                     all_matches.push((e2, e1, score));
                 }
             }
@@ -260,18 +245,15 @@ impl EventMatcher {
         
         // 处理方向2的匹配 (Kalshi → Polymarket) - 需要反转顺序
         for (e1, e2, score) in matches2 {
-            // 在方向2中，e1是Kalshi，e2是Polymarket
-            let pair_key = format!("{}:{}", e2.event_id, e1.event_id);  // 交换成 (PM, Kalshi) 的key
+            let pair_key = format!("{}:{}", e2.event_id, e1.event_id);
             let reverse_key = format!("{}:{}", e1.event_id, e2.event_id);
             
             if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
                 seen_pairs.insert(pair_key);
-                // 直接以 (PM, Kalshi) 的顺序存入
                 all_matches.push((e2, e1, score));
             }
         }
         
-        // 按相似度降序排序
         all_matches.sort_by(|a, b| {
             b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -281,6 +263,10 @@ impl EventMatcher {
         
         all_matches
     }
+
+
+
+
 
     fn find_matches_directional(
         &self,
@@ -309,7 +295,6 @@ impl EventMatcher {
                 );
 
                 for (item, similarity, _category) in similar {
-                    // 从传入的 target_events 中查找匹配的事件
                     if let Some(target_event) = target_events.iter().find(|e| {
                         format!("{}:{}", e.platform, e.event_id) == item.id
                     }) {
@@ -338,6 +323,13 @@ impl EventMatcher {
         
         all_matches
     }
+
+
+
+
+
+
+
 
     fn calculate_confidence(
         &self,

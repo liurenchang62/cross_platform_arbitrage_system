@@ -478,13 +478,7 @@ impl KalshiClient {
                     categories: Vec::new(),
                 };
                 
-                if market_count <= 20 {
-                    println!("🔍 [Kalshi事件] 序号={}, event_id={}, title={}", 
-                        market_count, 
-                        market_ticker,
-                        title.chars().take(30).collect::<String>()
-                    );
-                }
+                
                 
                 all_events.push(event);
             }
@@ -665,17 +659,10 @@ impl KalshiClient {
 
 
     pub async fn get_market_prices(&self, ticker: &str) -> Result<Option<MarketPrices>> {
-        // ==== 调试5: 每次请求价格都输出ticker ====
-        static PRICE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let count = PRICE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        println!("💰 [获取价格] #{}, ticker={}", count+1, ticker);
-        // ==== 结束调试5 ====
-        
         if let Some(cached) = self.price_cache.get(ticker).await {
             return Ok(Some(cached));
         }
         
-        // 修改这里：使用 /markets/{ticker} 接口
         let path = format!("/markets/{}", ticker);
         let url = format!("{}{}", self.base_url, path);
         
@@ -687,42 +674,39 @@ impl KalshiClient {
             .context("Failed to fetch Kalshi market")?;
         
         if !response.status().is_success() {
-            println!("      ⚠️ [价格获取失败] ticker={}, 状态码: {}", ticker, response.status());
             return Ok(None);
         }
         
         let data: serde_json::Value = response.json().await?;
         
-        // ==== 新增：输出前3个市场的完整返回数据 ====
-        if count < 3 {
-            println!("      📊 [Kalshi完整返回] ticker={}", ticker);
-            println!("      {}", serde_json::to_string_pretty(&data).unwrap());
-        }
-        // ==== 结束新增 ====
-        
-        // 单个市场接口返回的是 {"market": {...}} 格式
         if let Some(market) = data.get("market") {
             let yes_ask_dollars_str = market["yes_ask_dollars"].as_str().unwrap_or("0");
             let yes_bid_dollars_str = market["yes_bid_dollars"].as_str().unwrap_or("0");
-
-            let yes_ask_cents = (yes_ask_dollars_str.parse::<f64>().unwrap_or(0.0) * 100.0) as i64;
-            let yes_bid_cents = (yes_bid_dollars_str.parse::<f64>().unwrap_or(0.0) * 100.0) as i64;
-            let last_price_cents = market["last_price"].as_i64();
-            let volume = market["volume_24h"].as_f64().unwrap_or(0.0);
             
-            // 只输出前10个成功获取的价格
-            if count < 10 {
-                println!("      ✅ [价格获取成功] ticker={}, yes_ask={}, yes_bid={}", 
-                    ticker, yes_ask_cents, yes_bid_cents);
-            }
+            let yes_ask_dollars = yes_ask_dollars_str.parse::<f64>().unwrap_or(0.0);
+            let yes_bid_dollars = yes_bid_dollars_str.parse::<f64>().unwrap_or(0.0);
             
-            let yes_price = (yes_ask_cents as f64 + yes_bid_cents as f64) / 200.0;
+            let yes_ask_cents = (yes_ask_dollars * 100.0) as i64;
+            let yes_bid_cents = (yes_bid_dollars * 100.0) as i64;
+            
+            let last_price_cents = market["last_price"]
+                .as_i64()
+                .or_else(|| {
+                    market["last_price_dollars"]
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|v| (v * 100.0) as i64)
+                });
+            
+            let volume = market["volume_24h_fp"].as_f64().unwrap_or(0.0);
+            
+            let yes_price = (yes_ask_dollars + yes_bid_dollars) / 2.0;
             let no_price = 1.0 - yes_price;
             
             let prices = MarketPrices::new(yes_price, no_price, volume)
                 .with_asks(
-                    yes_ask_cents as f64 / 100.0,
-                    1.0 - (yes_bid_cents as f64 / 100.0),
+                    yes_ask_dollars,
+                    1.0 - yes_bid_dollars,
                     last_price_cents.map(|v| v as f64 / 100.0)
                 );
             
@@ -730,7 +714,6 @@ impl KalshiClient {
             return Ok(Some(prices));
         }
         
-        println!("      ⚠️ [价格获取失败] ticker={}, 响应中没有market字段", ticker);
         Ok(None)
     }
 
