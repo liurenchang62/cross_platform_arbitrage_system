@@ -172,6 +172,24 @@ async fn run_cycle(
     let mut opportunity_count = 0;
     
     for (pm_event, kalshi_event, similarity) in &matches {
+        // ==== 调试：输出两个事件的平台和ID ====
+        println!("🔍 [匹配事件对]");
+        println!("   PM: platform={}, event_id={}, title={}", 
+            pm_event.platform, 
+            pm_event.event_id,
+            pm_event.title.chars().take(30).collect::<String>()
+        );
+        println!("   Kalshi: platform={}, event_id={}, title={}", 
+            kalshi_event.platform,
+            kalshi_event.event_id,
+            kalshi_event.title.chars().take(30).collect::<String>()
+        );
+        // ==== 结束调试 ====
+
+
+
+
+
         // 获取价格
         let pm_prices = match polymarket.fetch_prices(pm_event).await {
             Ok(p) => p,
@@ -197,9 +215,19 @@ async fn run_cycle(
             println!("\n      🎯 发现套利机会! (相似度: {:.2})", similarity);
             println!("         📌 PM: {}", pm_event.title);
             println!("         📌 Kalshi: {}", kalshi_event.title);
+            println!("         📊 Polymarket价格: YES={:.3}, NO={:.3}", 
+                pm_prices.yes, pm_prices.no);
+            println!("         📊 Kalshi价格: YES={:.3}, NO={:.3}", 
+                kalshi_prices.yes, kalshi_prices.no);
             println!("         💰 策略: {}", opportunity.strategy);
             println!("         💵 净利润: ${:.3}", opportunity.net_profit);
             println!("         📊 ROI: {:.1}%", opportunity.roi_percent);
+            
+            // 新增：每5个匹配输出一个价格样本
+            if opportunity_count <= 3 {
+                println!("         📝 [价格样本] Kalshi原始数据: YES={:.3}, NO={:.3}", 
+                    kalshi_prices.yes, kalshi_prices.no);
+            }
             
             if let Err(e) = logger.log_opportunity(&opportunity) {
                 eprintln!("         ⚠️ 记录日志失败: {}", e);

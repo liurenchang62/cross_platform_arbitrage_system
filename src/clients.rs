@@ -71,7 +71,7 @@ impl PolymarketClient {
     pub async fn fetch_events(&self) -> Result<Vec<Event>> {
         let tag_slug = std::env::var("POLYMARKET_TAG_SLUG").ok();
         let tag_slug = tag_slug.as_deref().filter(|s| !s.is_empty());
-        self.fetch_events_from_gamma(tag_slug, 200).await
+        self.fetch_events_from_gamma(tag_slug, 500).await
     }
 
 
@@ -91,7 +91,7 @@ impl PolymarketClient {
         tag_slug: Option<&str>,
         limit: u32,
     ) -> Result<Vec<Event>> {
-        let limit = limit.min(50);  //縮減規模測試 $
+        let limit = limit.min(200);  //规模
         let limit_str = limit.to_string();
         let mut query = vec![
             ("active", "true"),
@@ -130,13 +130,6 @@ impl PolymarketClient {
         let mut events = Vec::new();
 
         for event_data in data {
-            // 在解析时打印
-            // 在解析时打印
-
-            // println!("[DEBUG] Polymarket event 所有字段: {:?}", 
-            //     event_data.as_object().map(|obj| obj.keys().collect::<Vec<_>>()));
-            
-            
             let tags: Vec<String> = event_data["tags"]
                 .as_array()
                 .map(|arr| {
@@ -147,22 +140,25 @@ impl PolymarketClient {
                 })
                 .unwrap_or_default();
 
-            //println!("[DEBUG] Polymarket tags: {:?}", tags);
-
             let category = if let Some(cat) = event_data["category"].as_str() {
                     Some(cat.to_string())
                 } else {
                     None
                 };
 
-            // 获取该事件下的所有市场
             if let Some(markets) = event_data["markets"].as_array() {
                 for market in markets {
-                    // 从 market 中提取所有需要的数据
+                    // 使用字段进行筛选：未关闭且未结算
+                    let is_closed = market["closed"].as_bool().unwrap_or(true);
+                    let is_resolved = market["umaResolutionStatus"].as_str() == Some("resolved");
+                    
+                    if is_closed || is_resolved {
+                        continue;
+                    }
+
                     let event_id = market["id"].as_str().unwrap_or_default().to_string();
                     let question = market["question"].as_str().unwrap_or_default().to_string();
                     
-                    // 解析 outcomePrices
                     let mut yes_price = 0.0;
                     let mut no_price = 0.0;
                     if let Some(prices_str) = market["outcomePrices"].as_str() {
@@ -176,20 +172,16 @@ impl PolymarketClient {
                         }
                     }
 
-                    // 获取其他价格字段
                     let best_ask = market["bestAsk"].as_f64();
                     let best_bid = market["bestBid"].as_f64();
                     let last_trade_price = market["lastTradePrice"].as_f64();
                     
-                    // 流动性/成交量
-                    // 流动性/成交量
                     let _volume = market["volume"]
                         .as_str()
                         .and_then(|v| v.parse::<f64>().ok())
                         .or_else(|| market["volumeNum"].as_f64())
                         .unwrap_or(0.0);
 
-                    // 解析 token_ids
                     let mut token_ids = Vec::new();
                     if let Some(token_ids_str) = market["clobTokenIds"].as_str() {
                         if let Ok(ids) = serde_json::from_str::<Vec<String>>(token_ids_str) {
@@ -197,13 +189,11 @@ impl PolymarketClient {
                         }
                     }
 
-                    // 解析到期日
                     let resolution_date = market["endDate"]
                         .as_str()
                         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                         .map(|dt| dt.with_timezone(&Utc));
 
-                    // 构建 Event
                     let event = Event {
                         platform: "polymarket".to_string(),
                         event_id: event_id.clone(),
@@ -219,7 +209,7 @@ impl PolymarketClient {
                         best_bid,
                         last_trade_price,
                         vector_cache: None,
-                        categories: Vec::new(),  // 新增字段
+                        categories: Vec::new(),
                     };
 
                     events.push(event);
@@ -229,16 +219,6 @@ impl PolymarketClient {
 
         Ok(events)
     }
-
-
-
-
-
-
-
-
-
-
 
 
     pub async fn fetch_prices(&self, event: &Event) -> Result<MarketPrices> {
@@ -270,7 +250,7 @@ impl PolymarketClient {
             }
         };
 
-        let liquidity = 0.0; // 可以从 volume 字段获取，但需要转换
+        let liquidity = 0.0;
 
         let prices = MarketPrices::new(yes_price, no_price, liquidity)
             .with_asks(
@@ -282,18 +262,19 @@ impl PolymarketClient {
         self.price_cache.set(event.event_id.clone(), prices.clone()).await;
         Ok(prices)
     }
-
-
-
-
-
-
-
-
-
-
-
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -350,7 +331,7 @@ impl KalshiClient {
             .query(&[
                 ("series_ticker", series_ticker),
                 ("status", "open"),
-                ("limit", "200"),
+                ("limit", "500"),   
             ])
             .send()
             .await
@@ -359,17 +340,25 @@ impl KalshiClient {
         let status = response.status();
         
         if !status.is_success() {
-            // 先获取状态码，再获取错误文本
             let error_text = response.text().await.unwrap_or_default();
             return Err(anyhow::anyhow!("Kalshi API error: {} - {}", status, error_text));
         }
         
         let data: serde_json::Value = response.json().await?;
         
-        // 从响应中提取 markets 数组
+        // 使用字段进行筛选：只保留活跃且未结算的市场
         let markets = data["markets"]
             .as_array()
-            .cloned()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|m| {
+                        let is_active = m["status"].as_str() == Some("active");
+                        let is_settled = m["result"].as_str().unwrap_or("") != "";
+                        is_active && !is_settled
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         
         Ok(markets)
@@ -379,136 +368,12 @@ impl KalshiClient {
 
 
 
-    // /// 获取所有Kalshi事件（最终版本 - 并发控制）
-    // pub async fn fetch_events(&self) -> Result<Vec<Event>> {
-    //     use futures::future::join_all;
-    //     use chrono::FixedOffset;
-    //     use std::sync::Arc;
-    //     use tokio::sync::Semaphore;
-        
-    //     // 第一步：获取所有事件系列
-    //     let path = "/events";
-    //     let url = format!("{}{}", self.base_url, path);
-        
-    //     let response = self
-    //         .http_client
-    //         .get(&url)
-    //         .query(&[
-    //             ("status", "open"),
-    //             ("limit", "200"),
-    //         ])
-    //         .send()
-    //         .await
-    //         .context("Failed to fetch Kalshi events")?;
-        
-    //     let status = response.status();
-        
-    //     if !status.is_success() {
-    //         let error_text = response.text().await.unwrap_or_default();
-    //         return Err(anyhow::anyhow!("Kalshi API error: {} - {}", status, error_text));
-    //     }
-        
-    //     let data: serde_json::Value = response.json().await?;
-        
-    //     // 提取所有 series_ticker 及其对应的 category
-    //     let mut series_info = Vec::new();  // (series_ticker, category)
-        
-    //     if let Some(events_array) = data["events"].as_array() {
-    //         for event_data in events_array {
-    //             if let Some(series) = event_data["series_ticker"].as_str() {
-    //                 let category = event_data["category"].as_str().map(String::from);
-    //                 series_info.push((series.to_string(), category));
-    //             }
-    //         }
-    //     }
-        
-    //     // 第二步：为每个 series_ticker 并行获取市场（限制并发数）
-    //     let semaphore = Arc::new(Semaphore::new(1)); // 最多5个并发
-    //     let mut tasks = Vec::new();
-        
-    //     for (series, _) in &series_info {
-    //         let semaphore = semaphore.clone();
-    //         let series = series.clone();
-    //         let client = self.clone(); // 需要 KalshiClient 实现 Clone
-            
-    //         let task = async move {
-    //             let _permit = semaphore.acquire().await.unwrap(); // 获取并发许可
-    //             client.fetch_markets_by_series(&series).await
-    //         };
-    //         tasks.push(task);
-    //     }
-        
-    //     // 等待所有并行任务完成
-    //     let results = join_all(tasks).await;
-        
-    //     // 处理所有结果
-    //     let mut all_events = Vec::new();
-        
-    //     for ((series, category), result) in series_info.into_iter().zip(results) {
-    //         let markets = match result {
-    //             Ok(m) => m,
-    //             Err(e) => {
-    //                 eprintln!("警告: 获取系列 {} 的市场失败: {}", series, e);
-    //                 continue;
-    //             }
-    //         };
-            
-    //         for market in markets {
-    //             // 提取候选人名称（如果有）
-    //             let candidate_name = market["yes_sub_title"]
-    //                 .as_str()
-    //                 .filter(|s: &&str| !s.is_empty())
-    //                 .unwrap_or("");
-                
-    //             // 构建标题：如果存在候选人，附加到标题后
-    //             let title = if !candidate_name.is_empty() {
-    //                 format!("{} - {}", 
-    //                     market["title"].as_str().unwrap_or(""),
-    //                     candidate_name
-    //                 )
-    //             } else {
-    //                 market["title"].as_str().unwrap_or("").to_string()
-    //             };
-                
-    //             // 提取价格（美分转美元）
-    //             let yes_ask_cents = market["yes_ask"].as_i64().unwrap_or(0);
-    //             let yes_bid_cents = market["yes_bid"].as_i64().unwrap_or(0);
-    //             let last_price_cents = market["last_price"].as_i64();
-                
-    //             let event = Event {
-    //                 platform: "kalshi".to_string(),
-    //                 event_id: market["ticker"]
-    //                     .as_str()
-    //                     .unwrap_or("")
-    //                     .to_string(),
-    //                 title,
-    //                 description: market["subtitle"]
-    //                     .as_str()
-    //                     .unwrap_or("")
-    //                     .to_string(),
-    //                 resolution_date: market["expiration_time"]
-    //                     .as_str()
-    //                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-    //                     .map(|dt: DateTime<FixedOffset>| dt.with_timezone(&Utc)),
-    //                 category: category.clone(),
-    //                 tags: Vec::new(),
-    //                 slug: market["ticker"].as_str().map(String::from),
-    //                 token_ids: Vec::new(),
-    //                 outcome_prices: None,
-    //                 best_ask: Some(yes_ask_cents as f64 / 100.0),
-    //                 best_bid: Some(yes_bid_cents as f64 / 100.0),
-    //                 last_trade_price: last_price_cents.map(|v| v as f64 / 100.0),
-    //             };
-                
-    //             all_events.push(event);
-    //         }
-    //     }
-        
-    //     Ok(all_events)
-    // }
+
 
 
     /// 获取所有Kalshi事件（串行版本 - 稳定可靠）
+        /// 获取所有Kalshi事件（串行版本 - 稳定可靠）
+        /// 获取所有Kalshi事件（串行版本 - 稳定可靠）
     pub async fn fetch_events(&self) -> Result<Vec<Event>> {
         use chrono::FixedOffset;
         
@@ -521,7 +386,7 @@ impl KalshiClient {
             .get(&url)
             .query(&[
                 ("status", "open"),
-                ("limit", "100"), //缩减
+                ("limit", "200"),  //规模
             ])
             .send()
             .await
@@ -550,6 +415,7 @@ impl KalshiClient {
         
         // 第二步：串行为每个 series_ticker 获取市场
         let mut all_events = Vec::new();
+        let mut market_count = 0;
         
         for (series, category) in series_info {
             let markets = match self.fetch_markets_by_series(&series).await {
@@ -561,11 +427,18 @@ impl KalshiClient {
             };
             
             for market in markets {
+                market_count += 1;
+                
                 // 提取候选人名称（如果有）
                 let candidate_name = market["yes_sub_title"]
                     .as_str()
                     .filter(|s: &&str| !s.is_empty())
                     .unwrap_or("");
+                
+                // 提取价格（美分转美元）
+                let yes_ask_cents = market["yes_ask"].as_i64().unwrap_or(0);
+                let yes_bid_cents = market["yes_bid"].as_i64().unwrap_or(0);
+                let last_price_cents = market["last_price"].as_i64();
                 
                 // 构建标题：如果存在候选人，附加到标题后
                 let title = if !candidate_name.is_empty() {
@@ -577,18 +450,14 @@ impl KalshiClient {
                     market["title"].as_str().unwrap_or("").to_string()
                 };
                 
-                // 提取价格（美分转美元）
-                let yes_ask_cents = market["yes_ask"].as_i64().unwrap_or(0);
-                let yes_bid_cents = market["yes_bid"].as_i64().unwrap_or(0);
-                let last_price_cents = market["last_price"].as_i64();
+                // 获取市场的 ticker（具体市场的 ID）
+                let market_ticker = market["ticker"].as_str().unwrap_or("").to_string();
                 
+                // 构建 Event - 使用市场的 ticker 作为 event_id
                 let event = Event {
                     platform: "kalshi".to_string(),
-                    event_id: market["ticker"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
-                    title,
+                    event_id: market_ticker.clone(),  // 使用具体市场的 ticker
+                    title: title.clone(),  // 克隆 title 供后续使用
                     description: market["subtitle"]
                         .as_str()
                         .unwrap_or("")
@@ -599,20 +468,29 @@ impl KalshiClient {
                         .map(|dt: DateTime<FixedOffset>| dt.with_timezone(&Utc)),
                     category: category.clone(),
                     tags: Vec::new(),
-                    slug: market["ticker"].as_str().map(String::from),
+                    slug: Some(market_ticker.clone()),  // 克隆 market_ticker
                     token_ids: Vec::new(),
                     outcome_prices: None,
                     best_ask: Some(yes_ask_cents as f64 / 100.0),
                     best_bid: Some(yes_bid_cents as f64 / 100.0),
                     last_trade_price: last_price_cents.map(|v| v as f64 / 100.0),
                     vector_cache: None,
-                    categories: Vec::new(),  // 新增字段
+                    categories: Vec::new(),
                 };
+                
+                if market_count <= 20 {
+                    println!("🔍 [Kalshi事件] 序号={}, event_id={}, title={}", 
+                        market_count, 
+                        market_ticker,
+                        title.chars().take(30).collect::<String>()
+                    );
+                }
                 
                 all_events.push(event);
             }
         }
         
+        println!("   ✅ 获取到 {} 个Kalshi具体市场", all_events.len());
         Ok(all_events)
     }
 
@@ -786,12 +664,18 @@ impl KalshiClient {
 
 
 
-    /// 获取市场价格（最终版本 - 修复所有权问题）
     pub async fn get_market_prices(&self, ticker: &str) -> Result<Option<MarketPrices>> {
+        // ==== 调试5: 每次请求价格都输出ticker ====
+        static PRICE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = PRICE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        println!("💰 [获取价格] #{}, ticker={}", count+1, ticker);
+        // ==== 结束调试5 ====
+        
         if let Some(cached) = self.price_cache.get(ticker).await {
             return Ok(Some(cached));
         }
         
+        // 修改这里：使用 /markets/{ticker} 接口
         let path = format!("/markets/{}", ticker);
         let url = format!("{}{}", self.base_url, path);
         
@@ -802,48 +686,52 @@ impl KalshiClient {
             .await
             .context("Failed to fetch Kalshi market")?;
         
-        let status = response.status();
-        
-        if !status.is_success() {
+        if !response.status().is_success() {
+            println!("      ⚠️ [价格获取失败] ticker={}, 状态码: {}", ticker, response.status());
             return Ok(None);
         }
         
         let data: serde_json::Value = response.json().await?;
         
-        // 提取市场数据
+        // ==== 新增：输出前3个市场的完整返回数据 ====
+        if count < 3 {
+            println!("      📊 [Kalshi完整返回] ticker={}", ticker);
+            println!("      {}", serde_json::to_string_pretty(&data).unwrap());
+        }
+        // ==== 结束新增 ====
+        
+        // 单个市场接口返回的是 {"market": {...}} 格式
         if let Some(market) = data.get("market") {
-            let yes_ask = market["yes_ask"]
-                .as_i64()
-                .unwrap_or(0) as f64 / 100.0;
-            let no_ask = market["no_ask"]
-                .as_i64()
-                .unwrap_or(0) as f64 / 100.0;
-            let yes_bid = market["yes_bid"]
-                .as_i64()
-                .unwrap_or(0) as f64 / 100.0;
-            let no_bid = market["no_bid"]
-                .as_i64()
-                .unwrap_or(0) as f64 / 100.0;
-            let last_price = market["last_price"]
-                .as_i64()
-                .map(|v| v as f64 / 100.0);
-            let liquidity = market["volume_24h"]
-                .as_i64()
-                .unwrap_or(0) as f64;
+            let yes_ask_dollars_str = market["yes_ask_dollars"].as_str().unwrap_or("0");
+            let yes_bid_dollars_str = market["yes_bid_dollars"].as_str().unwrap_or("0");
+
+            let yes_ask_cents = (yes_ask_dollars_str.parse::<f64>().unwrap_or(0.0) * 100.0) as i64;
+            let yes_bid_cents = (yes_bid_dollars_str.parse::<f64>().unwrap_or(0.0) * 100.0) as i64;
+            let last_price_cents = market["last_price"].as_i64();
+            let volume = market["volume_24h"].as_f64().unwrap_or(0.0);
             
-            // 对于二元市场，YES和NO的价格之和应该接近1
-            // 使用买卖价的中间值作为当前价格
-            let yes_price = (yes_ask + yes_bid) / 2.0;
-            let no_price = (no_ask + no_bid) / 2.0;
+            // 只输出前10个成功获取的价格
+            if count < 10 {
+                println!("      ✅ [价格获取成功] ticker={}, yes_ask={}, yes_bid={}", 
+                    ticker, yes_ask_cents, yes_bid_cents);
+            }
             
-            let prices = MarketPrices::new(yes_price, no_price, liquidity)
-                .with_asks(yes_ask, no_ask, last_price);
+            let yes_price = (yes_ask_cents as f64 + yes_bid_cents as f64) / 200.0;
+            let no_price = 1.0 - yes_price;
+            
+            let prices = MarketPrices::new(yes_price, no_price, volume)
+                .with_asks(
+                    yes_ask_cents as f64 / 100.0,
+                    1.0 - (yes_bid_cents as f64 / 100.0),
+                    last_price_cents.map(|v| v as f64 / 100.0)
+                );
             
             self.price_cache.set(ticker.to_string(), prices.clone()).await;
-            Ok(Some(prices))
-        } else {
-            Ok(None)
+            return Ok(Some(prices));
         }
+        
+        println!("      ⚠️ [价格获取失败] ticker={}, 响应中没有market字段", ticker);
+        Ok(None)
     }
 
 
