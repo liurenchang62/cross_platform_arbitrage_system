@@ -23,6 +23,11 @@ use clients::{PolymarketClient, KalshiClient};
 use event_matcher::{EventMatcher, EventMatcherConfig};
 use arbitrage_detector::ArbitrageDetector;
 use monitor_logger::MonitorLogger;
+use crate::arbitrage_detector::{
+    parse_polymarket_orderbook, 
+    parse_kalshi_orderbook, 
+    calculate_slippage_with_fixed_usdt
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,7 +51,7 @@ async fn main() -> Result<()> {
     
     // 初始化匹配器
     let matcher_config = EventMatcherConfig {
-        similarity_threshold: 0.5,
+        similarity_threshold: 0.8,
         use_date_boost: true,
         use_category_boost: true,
         date_boost_factor: 0.05,
@@ -75,6 +80,48 @@ async fn main() -> Result<()> {
     println!("📚 训练统一向量化器...");
     let all_events: Vec<Event> = kalshi_events.iter().chain(pm_events.iter()).cloned().collect();
     matcher.fit_vectorizer(&all_events);
+
+
+
+    // // ==== 临时测试：获取订单簿 ====
+    // println!("\n🔍 测试订单簿接口:");
+    
+    // // 测试 Polymarket orderbook
+    // if let Some(market) = pm_events.first() {
+    //     if let Some(token_id) = market.token_ids.first() {
+    //         println!("  尝试获取 Polymarket 订单簿, token_id={}", token_id);
+    //         match polymarket.get_order_book(token_id).await {
+    //             Ok(Some(ob)) => {
+    //                 println!("  ✅ Polymarket 订单簿获取成功");
+    //                 println!("  {}", serde_json::to_string_pretty(&ob).unwrap());
+    //             }
+    //             Ok(None) => println!("  ⚠️ Polymarket 订单簿不存在"),
+    //             Err(e) => println!("  ❌ Polymarket 订单簿失败: {}", e),
+    //         }
+    //     }
+    // }
+
+    // // 测试 Kalshi orderbook
+    // if let Some(market) = kalshi_events.first() {
+    //     println!("  尝试获取 Kalshi 订单簿, ticker={}", market.event_id);
+    //     match kalshi.get_order_book(&market.event_id).await {
+    //         Ok(Some(ob)) => {
+    //             println!("  ✅ Kalshi 订单簿获取成功");
+    //             println!("  {}", serde_json::to_string_pretty(&ob).unwrap());
+    //         }
+    //         Ok(None) => println!("  ⚠️ Kalshi 订单簿不存在"),
+    //         Err(e) => println!("  ❌ Kalshi 订单簿失败: {}", e),
+    //     }
+    // }
+    // // ==== 结束临时测试 ====
+
+
+
+
+
+
+
+
     
     // 构建双索引
     println!("🌲 构建 Kalshi 事件索引...");
@@ -134,11 +181,16 @@ async fn fetch_initial_events(
     Ok((kalshi_events, pm_events))
 }
 
-/// 运行单个监控周期
+
+
+
+
+
+
 async fn run_cycle(
     polymarket: &PolymarketClient,
     kalshi: &KalshiClient,
-    matcher: &mut EventMatcher,
+    matcher: &EventMatcher,
     arb_detector: &ArbitrageDetector,
     logger: &MonitorLogger,
     cycle_count: i32,
@@ -154,77 +206,162 @@ async fn run_cycle(
     println!("      Polymarket: {} 个, Kalshi: {} 个", 
         pm_events.len(), kalshi_events.len());
     
-    // 每10个周期重建一次索引（但保持向量化器不变）
-    if cycle_count % 10 == 0 {
-        println!("   🔄 重建索引...");
-        matcher.kalshi_index.clear();
-        matcher.polymarket_index.clear();
-        matcher.build_kalshi_index(&kalshi_events)?;
-        matcher.build_polymarket_index(&pm_events)?;
-    }
-    
-    // 双向匹配事件
-    println!("   🔍 双向匹配事件...");
+    // 匹配事件
+    println!("   🔍 匹配事件...");
     let matches = matcher.find_matches_bidirectional(&pm_events, &kalshi_events);
-    println!("      ✅ 找到 {} 个匹配对", matches.len());
+    println!("      ✅ 找到 {} 个潜在匹配对", matches.len());
     
-    // 检查套利机会
+    println!("\n📊 ====== 套利机会深度验证 ======");
+    
     let mut opportunity_count = 0;
+    let mut verified_count = 0;
+    let trade_amount = 100.0; // 固定交易金额 100 USDT
     
     for (pm_event, kalshi_event, similarity) in &matches {
-        
-
-
-
-
-
         // 获取价格
         let pm_prices = match polymarket.fetch_prices(pm_event).await {
             Ok(p) => p,
-            Err(e) => {
-                println!("      ⚠️ 无法获取 Polymarket 价格: {}", e);
-                continue;
-            }
+            Err(_) => continue,
         };
         
         let kalshi_prices = match kalshi.get_market_prices(&kalshi_event.event_id).await {
             Ok(Some(p)) => p,
-            _ => {
-                println!("      ⚠️ 无法获取 Kalshi 价格");
-                continue;
-            }
+            _ => continue,
         };
         
-        // 检查套利
-        if let Some(opportunity) = arb_detector.check_arbitrage(&pm_prices, &kalshi_prices) {
+        // 先用最优价检查潜在机会
+        if let Some(opportunity) = arb_detector.check_arbitrage_optimal(&pm_prices, &kalshi_prices) {
             opportunity_count += 1;
             
-            // 记录套利机会
-            println!("\n      🎯 发现套利机会! (相似度: {:.2})", similarity);
-            println!("         📌 PM: {}", pm_event.title);
-            println!("         📌 Kalshi: {}", kalshi_event.title);
-            println!("         📊 Polymarket价格: YES={:.3}, NO={:.3}", 
-                pm_prices.yes, pm_prices.no);
-            println!("         📊 Kalshi价格: YES={:.3}, NO={:.3}", 
-                kalshi_prices.yes, kalshi_prices.no);
-            println!("         💰 策略: {}", opportunity.strategy);
-            println!("         💵 净利润: ${:.3}", opportunity.net_profit);
-            println!("         📊 ROI: {:.1}%", opportunity.roi_percent);
+            // 确定策略对应的买卖方向
+            let (pm_side, kalshi_side) = if opportunity.strategy.contains("Buy Yes on Kalshi") {
+                ("NO", "YES")  // 买 Polymarket NO + 买 Kalshi YES
+            } else {
+                ("YES", "NO")  // 买 Polymarket YES + 买 Kalshi NO
+            };
             
-            if let Err(e) = logger.log_opportunity(&opportunity) {
-                eprintln!("         ⚠️ 记录日志失败: {}", e);
+            println!("\n  📌 潜在机会 #{} (相似度: {:.2})", opportunity_count, similarity);
+            println!("     PM: {}", pm_event.title);
+            println!("     Kalshi: {}", kalshi_event.title);
+            println!("     策略: {}", opportunity.strategy);
+            println!();
+            println!("     📊 最优价格:");
+            println!("        Polymarket {}: {:.3}", pm_side, 
+                if pm_side == "YES" { pm_prices.yes_ask.unwrap_or(pm_prices.yes) } 
+                else { pm_prices.no_ask.unwrap_or(pm_prices.no) });
+            println!("        Kalshi {}: {:.3}", kalshi_side,
+                if kalshi_side == "YES" { kalshi_prices.yes_ask.unwrap_or(kalshi_prices.yes) }
+                else { kalshi_prices.no_ask.unwrap_or(kalshi_prices.no) });
+            println!("     💰 理想利润, opportunity.total_cost, opportunity.roi_percent);
+            println!();
+            println!("     🔍 验证深度 (投入 {} USDT)...", trade_amount);
+            : ${:.3} | 理想成本: ${:.3} | ROI: {:.1}%", 
+                opportunity.net_profit
+            // 获取 Polymarket 订单簿
+            let pm_orderbook = if let Some(token_id) = pm_event.token_ids.first() {
+                match polymarket.get_order_book(token_id).await {
+                    Ok(Some(ob)) => parse_polymarket_orderbook(&ob, pm_side),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            
+            // 获取 Kalshi 订单簿
+            let kalshi_orderbook = match kalshi.get_order_book(&kalshi_event.event_id).await {
+                Ok(Some(ob)) => parse_kalshi_orderbook(&ob, kalshi_side),
+                _ => None,
+            };
+            
+            // 计算 Polymarket 滑点
+            let (pm_slip, pm_avg) = if let Some(ob) = pm_orderbook {
+                let info = calculate_slippage_with_fixed_usdt(&ob, trade_amount);
+                (info.slippage_percent, info.avg_price)
+            } else {
+                let price = if pm_side == "YES" { pm_prices.yes_ask.unwrap_or(pm_prices.yes) }
+                            else { pm_prices.no_ask.unwrap_or(pm_prices.no) };
+                (0.0, price)
+            };
+            
+            // 计算 Kalshi 滑点
+            let (kalshi_slip, kalshi_avg) = if let Some(ob) = kalshi_orderbook {
+                let info = calculate_slippage_with_fixed_usdt(&ob, trade_amount);
+                (info.slippage_percent, info.avg_price)
+            } else {
+                let price = if kalshi_side == "YES" { kalshi_prices.yes_ask.unwrap_or(kalshi_prices.yes) }
+                            else { kalshi_prices.no_ask.unwrap_or(kalshi_prices.no) };
+                (0.0, price)
+            };
+            
+            let optimal_pm_price = if pm_side == "YES" { pm_prices.yes_ask.unwrap_or(pm_prices.yes) }
+                                   else { pm_prices.no_ask.unwrap_or(pm_prices.no) };
+            let optimal_kalshi_price = if kalshi_side == "YES" { kalshi_prices.yes_ask.unwrap_or(kalshi_prices.yes) }
+                                       else { kalshi_prices.no_ask.unwrap_or(kalshi_prices.no) };
+            
+            println!();
+            println!("     📊 滑点分析:");
+            println!("        Polymarket {}: 最优价 {:.3} → 考虑滑点平均价 {:.3} ({:+.2}%)", 
+                pm_side, optimal_pm_price, pm_avg, pm_slip);
+            println!("        Kalshi {}: 最优价 {:.3} → 考虑滑点平均价 {:.3} ({:+.2}%)", 
+                kalshi_side, optimal_kalshi_price, kalshi_avg, kalshi_slip);
+            
+            // 用考虑了滑点的价格重新计算套利机会
+            let mut pm_adjusted = pm_prices.clone();
+            let mut kalshi_adjusted = kalshi_prices.clone();
+            
+            if pm_side == "YES" {
+                pm_adjusted.yes = pm_avg;
+            } else {
+                pm_adjusted.no = pm_avg;
             }
+            
+            if kalshi_side == "YES" {
+                kalshi_adjusted.yes = kalshi_avg;
+            } else {
+                kalshi_adjusted.no = kalshi_avg;
+            }
+            
+            if let Some(verified) = arb_detector.check_arbitrage_optimal(&pm_adjusted, &kalshi_adjusted) {
+                verified_count += 1;
+                println!();
+                println!("     ✅ 考虑滑点后仍然有机会!");
+                println!("        💰 实际利润: ${:.3} | 实际成本: ${:.3} | ROI: {:.1}%", 
+                    verified.net_profit, verified.total_cost, verified.roi_percent);
+                
+                // 记录套利机会
+                if let Err(e) = logger.log_opportunity(&verified) {
+                    eprintln!("         ⚠️ 记录日志失败: {}", e);
+                }
+            } else {
+                println!();
+                println!("     ❌ 考虑滑点后无套利机会");
+            }
+            println!("     ────────────────────────────────────");
         }
     }
+    
+    println!("\n📊 ====== 周期统计 ======");
+    println!("   潜在机会: {} 个", opportunity_count);
+    println!("   验证通过: {} 个", verified_count);
+    println!("   验证失败: {} 个", opportunity_count - verified_count);
     
     let elapsed = chrono::Local::now() - start_time;
     println!("   ⏱️ 周期完成, 耗时: {}ms", elapsed.num_milliseconds());
     
     Ok(CycleStats {
         matches: matches.len(),
-        opportunities: opportunity_count,
+        opportunities: verified_count,
     })
 }
+
+
+
+
+
+
+
+
+
 
 /// 周期统计
 struct CycleStats {

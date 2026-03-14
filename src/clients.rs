@@ -148,6 +148,9 @@ impl PolymarketClient {
 
             if let Some(markets) = event_data["markets"].as_array() {
                 for market in markets {
+                    
+
+
                     // 使用字段进行筛选：未关闭且未结算
                     let is_closed = market["closed"].as_bool().unwrap_or(true);
                     let is_resolved = market["umaResolutionStatus"].as_str() == Some("resolved");
@@ -262,27 +265,35 @@ impl PolymarketClient {
         self.price_cache.set(event.event_id.clone(), prices.clone()).await;
         Ok(prices)
     }
+
+
+
+    pub async fn get_order_book(&self, token_id: &str) -> Result<Option<serde_json::Value>> {
+        let url = format!("https://clob.polymarket.com/book");
+        let response = self
+            .http_client
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await
+            .context("Failed to fetch Polymarket order book")?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let data: serde_json::Value = response.json().await?;
+        Ok(Some(data))
+    }
+
+
+
+
+
+
+
+
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -293,6 +304,10 @@ impl Default for PolymarketClient {
         Self::new()
     }
 }
+
+
+
+
 
 const KALSHI_DEFAULT_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
@@ -678,6 +693,8 @@ impl KalshiClient {
         }
         
         let data: serde_json::Value = response.json().await?;
+
+        
         
         if let Some(market) = data.get("market") {
             let yes_ask_dollars_str = market["yes_ask_dollars"].as_str().unwrap_or("0");
@@ -766,6 +783,27 @@ impl KalshiClient {
         let no_ask = (100.0 - best_yes_bid_cents) / 100.0;
         (yes_ask, no_ask)
     }
+
+
+
+    pub async fn get_order_book(&self, ticker: &str) -> Result<Option<serde_json::Value>> {
+        let path = format!("/markets/{}/orderbook", ticker);
+        let url = format!("{}{}", self.base_url, path);
+        
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch Kalshi order book")?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let data: serde_json::Value = response.json().await?;
+        Ok(Some(data))
+}
 
     
 }
