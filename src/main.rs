@@ -81,48 +81,6 @@ async fn main() -> Result<()> {
     let all_events: Vec<Event> = kalshi_events.iter().chain(pm_events.iter()).cloned().collect();
     matcher.fit_vectorizer(&all_events);
 
-
-
-    // // ==== 临时测试：获取订单簿 ====
-    // println!("\n🔍 测试订单簿接口:");
-    
-    // // 测试 Polymarket orderbook
-    // if let Some(market) = pm_events.first() {
-    //     if let Some(token_id) = market.token_ids.first() {
-    //         println!("  尝试获取 Polymarket 订单簿, token_id={}", token_id);
-    //         match polymarket.get_order_book(token_id).await {
-    //             Ok(Some(ob)) => {
-    //                 println!("  ✅ Polymarket 订单簿获取成功");
-    //                 println!("  {}", serde_json::to_string_pretty(&ob).unwrap());
-    //             }
-    //             Ok(None) => println!("  ⚠️ Polymarket 订单簿不存在"),
-    //             Err(e) => println!("  ❌ Polymarket 订单簿失败: {}", e),
-    //         }
-    //     }
-    // }
-
-    // // 测试 Kalshi orderbook
-    // if let Some(market) = kalshi_events.first() {
-    //     println!("  尝试获取 Kalshi 订单簿, ticker={}", market.event_id);
-    //     match kalshi.get_order_book(&market.event_id).await {
-    //         Ok(Some(ob)) => {
-    //             println!("  ✅ Kalshi 订单簿获取成功");
-    //             println!("  {}", serde_json::to_string_pretty(&ob).unwrap());
-    //         }
-    //         Ok(None) => println!("  ⚠️ Kalshi 订单簿不存在"),
-    //         Err(e) => println!("  ❌ Kalshi 订单簿失败: {}", e),
-    //     }
-    // }
-    // // ==== 结束临时测试 ====
-
-
-
-
-
-
-
-
-    
     // 构建双索引
     println!("🌲 构建 Kalshi 事件索引...");
     matcher.build_kalshi_index(&kalshi_events)?;
@@ -180,12 +138,6 @@ async fn fetch_initial_events(
     
     Ok((kalshi_events, pm_events))
 }
-
-
-
-
-
-
 
 async fn run_cycle(
     polymarket: &PolymarketClient,
@@ -252,11 +204,11 @@ async fn run_cycle(
             println!("        Kalshi {}: {:.3}", kalshi_side,
                 if kalshi_side == "YES" { kalshi_prices.yes_ask.unwrap_or(kalshi_prices.yes) }
                 else { kalshi_prices.no_ask.unwrap_or(kalshi_prices.no) });
-            println!("     💰 理想利润, opportunity.total_cost, opportunity.roi_percent);
+            println!("     💰 理想利润: {:.3} | 理想成本: {:.3} | ROI: {:.1}%", 
+                opportunity.net_profit, opportunity.total_cost, opportunity.roi_percent);
             println!();
             println!("     🔍 验证深度 (投入 {} USDT)...", trade_amount);
-            : ${:.3} | 理想成本: ${:.3} | ROI: {:.1}%", 
-                opportunity.net_profit
+            
             // 获取 Polymarket 订单簿
             let pm_orderbook = if let Some(token_id) = pm_event.token_ids.first() {
                 match polymarket.get_order_book(token_id).await {
@@ -300,9 +252,9 @@ async fn run_cycle(
             
             println!();
             println!("     📊 滑点分析:");
-            println!("        Polymarket {}: 最优价 {:.3} → 考虑滑点平均价 {:.3} ({:+.2}%)", 
+            println!("        Polymarket {}: 最优价 {:.3} -> 考虑滑点平均价 {:.3} ({:+.2}%)", 
                 pm_side, optimal_pm_price, pm_avg, pm_slip);
-            println!("        Kalshi {}: 最优价 {:.3} → 考虑滑点平均价 {:.3} ({:+.2}%)", 
+            println!("        Kalshi {}: 最优价 {:.3} -> 考虑滑点平均价 {:.3} ({:+.2}%)", 
                 kalshi_side, optimal_kalshi_price, kalshi_avg, kalshi_slip);
             
             // 用考虑了滑点的价格重新计算套利机会
@@ -334,34 +286,27 @@ async fn run_cycle(
                 }
             } else {
                 println!();
-                println!("     ❌ 考虑滑点后无套利机会");
+                println!("     ❌ 考虑滑点后无套利机会 ");
             }
-            println!("     ────────────────────────────────────");
+            println!("     ------------------------------------");
         }
     }
     
-    println!("\n📊 ====== 周期统计 ======");
-    println!("   潜在机会: {} 个", opportunity_count);
-    println!("   验证通过: {} 个", verified_count);
-    println!("   验证失败: {} 个", opportunity_count - verified_count);
+    println!("");
+    println!("====== 周期统计 ======");
+    println!("   潜在机会: {} 个 ", opportunity_count);
+    println!("   验证通过: {} 个 ", verified_count);
+    println!("   验证失败: {} 个 ", opportunity_count - verified_count);
     
     let elapsed = chrono::Local::now() - start_time;
-    println!("   ⏱️ 周期完成, 耗时: {}ms", elapsed.num_milliseconds());
+    let duration_ms = elapsed.num_milliseconds();
+    println!("   周期完成, 耗时: {} ms", duration_ms);
     
     Ok(CycleStats {
         matches: matches.len(),
         opportunities: verified_count,
     })
 }
-
-
-
-
-
-
-
-
-
 
 /// 周期统计
 struct CycleStats {
