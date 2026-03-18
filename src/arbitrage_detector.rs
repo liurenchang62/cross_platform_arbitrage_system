@@ -1,7 +1,10 @@
 // src/arbitrage_detector.rs
 use crate::market::MarketPrices;
 use serde_json::Value;
+use std::collections::HashMap;
 
+/// Gas 费配置（固定值，单位 USDT）
+pub const GAS_FEE: f64 = 0.02;  // 每笔交易 $0.02
 
 #[derive(Debug, Clone)]
 pub struct ArbitrageOpportunity {
@@ -13,6 +16,9 @@ pub struct ArbitrageOpportunity {
     pub fees: f64,
     pub net_profit: f64,
     pub roi_percent: f64,
+    pub gas_fee: f64,
+    pub final_profit: f64,
+    pub final_roi_percent: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,12 +54,71 @@ impl ArbitrageDetector {
         self
     }
 
+    pub fn calculate_final_profit(
+        &self,
+        pm_prices: &MarketPrices,
+        kalshi_prices: &MarketPrices,
+        pm_slippage: f64,
+        kalshi_slippage: f64,
+    ) -> Option<ArbitrageOpportunity> {
+        let opportunity = match self.check_arbitrage_optimal(pm_prices, kalshi_prices) {
+            Some(opp) => opp,
+            None => return None,
+        };
+
+        let pm_slipped = if opportunity.strategy.contains("Buy Yes on Polymarket") {
+            pm_prices.yes * (1.0 + pm_slippage / 100.0)
+        } else {
+            pm_prices.no * (1.0 + pm_slippage / 100.0)
+        };
+
+        let kalshi_slipped = if opportunity.strategy.contains("Buy Yes on Kalshi") {
+            kalshi_prices.yes * (1.0 + kalshi_slippage / 100.0)
+        } else {
+            kalshi_prices.no * (1.0 + kalshi_slippage / 100.0)
+        };
+
+        let slipped_cost = pm_slipped + kalshi_slipped;
+        let slipped_profit = 1.0 - slipped_cost;
+
+        if slipped_profit <= 0.0 {
+            return None;
+        }
+
+        let total_fees = self.fees.polymarket + self.fees.kalshi;
+        let net_profit = slipped_profit - total_fees;
+        let final_profit = net_profit - GAS_FEE;
+
+        if final_profit <= self.min_profit_threshold {
+            return None;
+        }
+
+        let roi = if slipped_cost > 0.0 {
+            (final_profit / slipped_cost) * 100.0
+        } else {
+            0.0
+        };
+
+        Some(ArbitrageOpportunity {
+            strategy: opportunity.strategy,
+            kalshi_action: opportunity.kalshi_action,
+            polymarket_action: opportunity.polymarket_action,
+            total_cost: slipped_cost,
+            gross_profit: slipped_profit,
+            fees: total_fees,
+            net_profit,
+            roi_percent: (net_profit / slipped_cost) * 100.0,
+            gas_fee: GAS_FEE,
+            final_profit,
+            final_roi_percent: roi,
+        })
+    }
+
     pub fn check_arbitrage_optimal(
         &self,
         pm_prices: &MarketPrices,
         kalshi_prices: &MarketPrices,
     ) -> Option<ArbitrageOpportunity> {
-        // 验证价格有效性
         if kalshi_prices.yes == 0.0 && kalshi_prices.no == 0.0 {
             return None;
         }
@@ -61,7 +126,6 @@ impl ArbitrageDetector {
             return None;
         }
 
-        // 确保有必要的 ask 数据
         if pm_prices.yes_ask.is_none() || pm_prices.no_ask.is_none() {
             return None;
         }
@@ -74,17 +138,14 @@ impl ArbitrageDetector {
         let kalshi_yes_ask = kalshi_prices.yes_ask.unwrap();
         let kalshi_no_ask = kalshi_prices.no_ask.unwrap();
 
-        // 策略1: Buy Yes on Kalshi + Buy No on Polymarket
         let cost_strategy_1 = kalshi_yes_ask + pm_no_ask;
         let profit_strategy_1 = 1.0 - cost_strategy_1;
 
-        // 策略2: Buy No on Kalshi + Buy Yes on Polymarket
         let cost_strategy_2 = kalshi_no_ask + pm_yes_ask;
         let profit_strategy_2 = 1.0 - cost_strategy_2;
 
         let total_fees = self.fees.polymarket + self.fees.kalshi;
 
-        // 检查策略1
         if profit_strategy_1 > total_fees + self.min_profit_threshold {
             let net_profit = profit_strategy_1 - total_fees;
             let roi = if cost_strategy_1 > 0.0 {
@@ -102,10 +163,12 @@ impl ArbitrageDetector {
                 fees: total_fees,
                 net_profit,
                 roi_percent: roi,
+                gas_fee: 0.0,
+                final_profit: 0.0,
+                final_roi_percent: 0.0,
             });
         }
 
-        // 检查策略2
         if profit_strategy_2 > total_fees + self.min_profit_threshold {
             let net_profit = profit_strategy_2 - total_fees;
             let roi = if cost_strategy_2 > 0.0 {
@@ -123,23 +186,18 @@ impl ArbitrageDetector {
                 fees: total_fees,
                 net_profit,
                 roi_percent: roi,
+                gas_fee: 0.0,
+                final_profit: 0.0,
+                final_roi_percent: 0.0,
             });
         }
 
         None
     }
-
-    // 兼容旧调用
-    pub fn check_arbitrage(
-        &self,
-        pm_prices: &MarketPrices,
-        kalshi_prices: &MarketPrices,
-    ) -> Option<ArbitrageOpportunity> {
-        self.check_arbitrage_optimal(pm_prices, kalshi_prices)
-    }
 }
 
-// 滑点计算相关函数
+// ==================== 滑点计算相关函数（需要公开导出）====================
+
 #[derive(Debug, Clone)]
 pub struct SlippageInfo {
     pub avg_price: f64,

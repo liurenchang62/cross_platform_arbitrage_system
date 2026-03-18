@@ -8,6 +8,7 @@ use crate::query_params::SIMILARITY_THRESHOLD;
 use crate::category_vectorizer::{CategoryVectorizerManager};
 use crate::text_vectorizer::VectorizerConfig;
 use crate::validation::ValidationPipeline;
+use tokio::join;
 
 use std::collections::HashMap;
 use anyhow::Result;
@@ -220,7 +221,7 @@ impl MarketMatcher {
         Ok(())
     }
 
-    pub fn find_matches_bidirectional(
+    pub async fn find_matches_bidirectional(
         &mut self,
         pm_markets: &[Market],
         kalshi_markets: &[Market],
@@ -234,37 +235,35 @@ impl MarketMatcher {
 
         println!("\n🔍 ====== 开始双向匹配 ======");
         
-        println!("\n📊 共同类别检查:");
-        let all_categories = self.polymarket_vectorizers.get_all_categories();
+        // 创建两个独立的验证管道
+        let mut pipeline1 = ValidationPipeline::new();
+        let mut pipeline2 = ValidationPipeline::new();
         
-        for cat in &all_categories {
-            let k_size = self.kalshi_vectorizers.category_size(cat);
-            let p_size = self.polymarket_vectorizers.category_size(cat);
-            if k_size > 0 && p_size > 0 {
-                println!("   ✅ {}: Kalshi {} 个, Polymarket {} 个", cat, k_size, p_size);
-            }
-        }
+        let start_time = std::time::Instant::now();
         
-        println!("\n   📌 方向1: Polymarket → Kalshi");
-        // 使用静态方法，完全避免借用 self
-        let matches1 = Self::find_matches_directional_static(
-            pm_markets,
-            &self.kalshi_vectorizers,
-            &self.category_mapper,
-            &self.config,
-            &self.market_cache,
-            &mut self.validation_pipeline,
+        println!("\n📌 并行执行两个方向...");
+        
+        // 真正的并行执行
+        let (matches1, matches2) = tokio::join!(
+            Self::find_matches_directional(
+                pm_markets,
+                &self.kalshi_vectorizers,
+                &self.category_mapper,
+                &self.config,
+                &self.market_cache,
+                &mut pipeline1,
+            ),
+            Self::find_matches_directional(
+                kalshi_markets,
+                &self.polymarket_vectorizers,
+                &self.category_mapper,
+                &self.config,
+                &self.market_cache,
+                &mut pipeline2,
+            )
         );
         
-        println!("\n   📌 方向2: Kalshi → Polymarket");
-        let matches2 = Self::find_matches_directional_static(
-            kalshi_markets,
-            &self.polymarket_vectorizers,
-            &self.category_mapper,
-            &self.config,
-            &self.market_cache,
-            &mut self.validation_pipeline,
-        );
+        let initial_count = matches1.len() + matches2.len();
         
         let mut all_matches = Vec::new();
         let mut seen_pairs = std::collections::HashSet::new();
@@ -295,23 +294,31 @@ impl MarketMatcher {
         
         all_matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        println!("\n📊 ====== 匹配完成 ======");
-        println!("   共找到 {} 个匹配对", all_matches.len());
-        println!("   二筛过滤: {} 个", self.validation_pipeline.filtered_count);
+        let final_count = all_matches.len();
+        let filtered_count = initial_count - final_count;
         
-        println!("\n📊 最高相似度匹配 (前10):");
-        for (i, (pm, kalshi, score)) in all_matches.iter().take(10).enumerate() {
-            println!("  {}. 相似度: {:.3}", i+1, score);
-            println!("     PM: {}", pm.title);
-            println!("     Kalshi: {}", kalshi.title);
-            println!();
+        self.validation_pipeline.filtered_count = filtered_count;
+        
+        for (cat, samples) in pipeline1.retained_samples {
+            self.validation_pipeline.retained_samples.insert(cat, samples);
         }
+        for (cat, samples) in pipeline2.retained_samples {
+            self.validation_pipeline.retained_samples.insert(cat, samples);
+        }
+
+        let elapsed = start_time.elapsed();
+        println!("\n📊 ====== 匹配统计 ======");
+        println!("   并行匹配耗时: {:?}", elapsed);
+        println!("   初筛匹配对: {} 个", initial_count);
+        println!("   二筛过滤: {} 个", filtered_count);
+        println!("   二筛后待跟踪: {} 个", final_count);
+        
+        self.validation_pipeline.print_retained_samples();
         
         all_matches
     }
 
-    /// 静态方法，不借用 self，避免借用检查错误
-    fn find_matches_directional_static(
+    async fn find_matches_directional(
         query_markets: &[Market],
         target_vectorizers: &CategoryVectorizerManager,
         category_mapper: &CategoryMapper,
@@ -322,7 +329,7 @@ impl MarketMatcher {
         let mut all_matches = Vec::new();
         let total = query_markets.len();
         
-        println!("\n      🔍 开始匹配 {} 个市场...", total);
+        println!("      🔍 匹配 {} 个市场...", total);
         let start_time = std::time::Instant::now();
         
         for (idx, query_market) in query_markets.iter().enumerate() {
@@ -343,13 +350,11 @@ impl MarketMatcher {
                     let similar = vectorizer.find_similar(
                         &query_market.title,
                         config.similarity_threshold,
-                        10,
+                        5,
                     );
                     
                     for (item, similarity) in similar {
                         if let Some(target_market) = market_cache.get(&item.id) {
-                            // 在 find_matches_directional_static 函数中修改调用
-
                             if !validation_pipeline.validate(
                                 &query_market.title, 
                                 &target_market.title,
@@ -359,7 +364,7 @@ impl MarketMatcher {
                                 continue;
                             }
                             
-                            let confidence = Self::calculate_confidence_static(
+                            let confidence = Self::calculate_confidence(
                                 query_market,
                                 target_market,
                                 similarity,
@@ -379,15 +384,13 @@ impl MarketMatcher {
             }
         }
         
-        // 在函数末尾，返回 all_matches 之前
-        validation_pipeline.print_retained_samples();
-        println!("        匹配完成，找到 {} 个匹配", all_matches.len());
+        let elapsed = start_time.elapsed();
+        println!("        匹配完成，耗时: {:?}", elapsed);
         
         all_matches
     }
 
-    /// 静态方法计算置信度
-    fn calculate_confidence_static(
+    fn calculate_confidence(
         market1: &Market,
         market2: &Market,
         vector_similarity: f64,
