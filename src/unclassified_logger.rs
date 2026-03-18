@@ -1,38 +1,28 @@
 // src/unclassified_logger.rs
-//! 未分类日志模块：记录没有匹配到任何类别的事件
-//! 
-//! 按天分文件存储，自动去重，便于后续分析添加新规则
+//! 未分类日志模块：记录没有匹配到任何类别的市场
 
-use chrono::{Local, Datelike};
-use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{Write, BufWriter};
+use chrono::{Local, Duration as ChronoDuration, TimeZone};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions, File};
+use std::io::{Write, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context};
-use crate::event::Event;
+use crate::market::Market;
 
 /// 未分类日志记录
 #[derive(Debug)]
 struct UnclassifiedRecord {
-    /// 时间戳
     timestamp: String,
-    /// 事件ID
-    event_id: String,
-    /// 平台
+    market_id: String,
     platform: String,
-    /// 标题
     title: String,
-    /// 提取的关键词
     keywords: String,
 }
 
 /// 未分类日志器
 pub struct UnclassifiedLogger {
-    /// 日志目录
     log_dir: PathBuf,
-    /// 当天已记录的标题哈希集合（用于去重）
     today_records: HashSet<String>,
-    /// 当前日期
     current_date: String,
 }
 
@@ -60,39 +50,41 @@ impl UnclassifiedLogger {
         }
     }
     
-    /// 记录未分类事件
-    pub fn log_unclassified(&mut self, event: &Event) -> Result<()> {
+    /// 记录未分类市场
+    pub fn log_unclassified(&mut self, market: &Market) -> Result<()> {
         self.check_date_change();
         
-        // 生成标题哈希用于去重
-        let title_hash = format!("{}:{}", event.platform, event.event_id);
+        // 生成唯一标识用于去重
+        let record_id = format!("{}:{}", market.platform, market.market_id);
         
         // 检查是否已在今日记录过
-        if self.today_records.contains(&title_hash) {
-            return Ok(()); // 已记录，跳过
+        if self.today_records.contains(&record_id) {
+            return Ok(());
         }
         
-        // 从标题提取关键词（简单提取长度>3的词）
-        let keywords: Vec<String> = event.title
+        // 从标题提取关键词（长度>3的词，去重）
+        let keywords: Vec<String> = market.title
             .to_lowercase()
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
             .filter(|w| w.len() > 3)
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
         
         let record = UnclassifiedRecord {
             timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            event_id: event.event_id.clone(),
-            platform: event.platform.clone(),
-            title: event.title.clone(),
+            market_id: market.market_id.clone(),
+            platform: market.platform.clone(),
+            title: market.title.clone(),
             keywords: keywords.join(","),
         };
         
         // 写入日志文件
         self.write_record(&record)?;
         
-        // 记录哈希
-        self.today_records.insert(title_hash);
+        // 记录已处理
+        self.today_records.insert(record_id);
         
         Ok(())
     }
@@ -110,11 +102,11 @@ impl UnclassifiedLogger {
             .open(&log_file)
             .context(format!("打开日志文件失败: {:?}", log_file))?;
         
-        let mut writer = BufWriter::new(file);
+        let mut writer = std::io::BufWriter::new(file);
         
         // 如果是新文件，写入表头
         if !file_exists {
-            writeln!(writer, "timestamp,event_id,platform,title,keywords")?;
+            writeln!(writer, "timestamp,market_id,platform,title,keywords")?;
         }
         
         // 写入记录
@@ -122,20 +114,20 @@ impl UnclassifiedLogger {
             writer,
             "{},{},{},\"{}\",{}",
             record.timestamp,
-            record.event_id,
+            record.market_id,
             record.platform,
-            record.title.replace('"', "\"\""), // CSV 转义
+            record.title.replace('"', "\"\""),
             record.keywords
         )?;
         
         Ok(())
     }
     
-    /// 批量记录未分类事件
-    pub fn log_batch_unclassified(&mut self, events: &[Event]) -> Result<usize> {
+    /// 批量记录未分类市场
+    pub fn log_batch_unclassified(&mut self, markets: &[Market]) -> Result<usize> {
         let mut count = 0;
-        for event in events {
-            if self.log_unclassified(event).is_ok() {
+        for market in markets {
+            if self.log_unclassified(market).is_ok() {
                 count += 1;
             }
         }
@@ -147,22 +139,21 @@ impl UnclassifiedLogger {
         self.today_records.len()
     }
     
-    /// 获取日志文件路径
-    pub fn get_log_file_path(&self) -> PathBuf {
+    /// 获取今日日志文件路径
+    pub fn get_today_log_path(&self) -> PathBuf {
         let date = Local::now().format("%Y-%m-%d");
         self.log_dir.join(format!("unclassified-{}.csv", date))
     }
     
-    /// 分析日志文件，统计高频关键词
-    pub fn analyze_logs(days: i64) -> Result<Vec<(String, usize)>> {
-        let mut keyword_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    /// 分析最近N天的日志，统计高频关键词
+    pub fn analyze_recent_logs(days: i64) -> Result<Vec<(String, usize)>> {
         let log_dir = Path::new("logs/unclassified");
-        
         if !log_dir.exists() {
             return Ok(Vec::new());
         }
         
-        let cutoff_date = Local::now() - chrono::Duration::days(days);
+        let cutoff_date = Local::now() - ChronoDuration::days(days);
+        let mut keyword_count: HashMap<String, usize> = HashMap::new();
         
         for entry in fs::read_dir(log_dir)? {
             let entry = entry?;
@@ -173,24 +164,33 @@ impl UnclassifiedLogger {
                 continue;
             }
             
-            // 检查文件修改时间
-            let metadata = fs::metadata(&path)?;
-            if let Ok(modified) = metadata.modified() {
-                let modified: chrono::DateTime<Local> = modified.into();
-                if modified < cutoff_date {
-                    continue; // 跳过旧文件
+            // 从文件名提取日期
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            let date_str = filename.replace("unclassified-", "").replace(".csv", "");
+            
+            // 解析日期并检查是否在范围内
+            if let Ok(file_date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                let file_datetime = Local
+                    .from_local_datetime(&file_date.and_hms_opt(0, 0, 0).unwrap())
+                    .unwrap();
+                if file_datetime < cutoff_date {
+                    continue;
                 }
             }
             
             // 读取文件内容
-            let content = fs::read_to_string(&path)?;
-            for line in content.lines().skip(1) { // 跳过表头
-                let fields: Vec<&str> = line.split(',').collect();
-                if fields.len() >= 5 {
-                    let keywords_str = fields[4];
-                    for keyword in keywords_str.split(',') {
-                        if !keyword.is_empty() {
-                            *keyword_count.entry(keyword.to_string()).or_insert(0) += 1;
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+            
+            for line in reader.lines().skip(1) { // 跳过表头
+                if let Ok(line) = line {
+                    let fields: Vec<&str> = line.split(',').collect();
+                    if fields.len() >= 5 {
+                        let keywords_str = fields[4];
+                        for keyword in keywords_str.split(',') {
+                            if !keyword.is_empty() {
+                                *keyword_count.entry(keyword.to_string()).or_insert(0) += 1;
+                            }
                         }
                     }
                 }
@@ -206,30 +206,9 @@ impl UnclassifiedLogger {
     }
 }
 
-/// 便捷函数：快速记录未分类事件
-pub fn log_unclassified_event(logger: &mut UnclassifiedLogger, event: &Event) {
-    if let Err(e) = logger.log_unclassified(event) {
-        eprintln!("⚠️ 记录未分类事件失败: {}", e);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-    
-    #[test]
-    fn test_logger_creation() {
-        let dir = tempdir().unwrap();
-        let mut logger = UnclassifiedLogger::new(dir.path()).unwrap();
-        
-        let event = Event::new(
-            "polymarket".to_string(),
-            "123".to_string(),
-            "Test Event".to_string(),
-            "".to_string(),
-        );
-        
-        assert!(logger.log_unclassified(&event).is_ok());
+/// 便捷函数：快速记录未分类市场
+pub fn log_unclassified_market(logger: &mut UnclassifiedLogger, market: &Market) {
+    if let Err(e) = logger.log_unclassified(market) {
+        eprintln!("⚠️ 记录未分类市场失败: {}", e);
     }
 }

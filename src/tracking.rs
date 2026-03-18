@@ -1,0 +1,84 @@
+// tracking.rs
+use chrono::{DateTime, Utc};
+use crate::market::{Market, MarketPrices};
+
+/// 追踪的套利对
+pub struct TrackedArbitrage {
+    pub pair_id: String,
+    pub pm_market: Market,
+    pub kalshi_market: Market,
+    pub similarity: f64,
+    pub last_pm_price: Option<MarketPrices>,
+    pub last_kalshi_price: Option<MarketPrices>,
+    pub best_profit: f64,
+    pub last_check: DateTime<Utc>,
+    pub active: bool,
+}
+
+impl TrackedArbitrage {
+    pub fn new(pm_market: Market, kalshi_market: Market, similarity: f64) -> Self {
+        Self {
+            pair_id: format!("{}:{}", pm_market.market_id, kalshi_market.market_id),
+            pm_market,
+            kalshi_market,
+            similarity,
+            last_pm_price: None,
+            last_kalshi_price: None,
+            best_profit: 0.0,
+            last_check: Utc::now(),
+            active: true,
+        }
+    }
+}
+
+/// 监控状态
+pub struct MonitorState {
+    pub tracked_pairs: Vec<TrackedArbitrage>,
+    pub current_cycle: usize,
+    pub full_match_interval: usize,
+    pub market_limit: usize,
+}
+
+impl MonitorState {
+    pub fn new(full_match_interval: usize, market_limit: usize) -> Self {
+        Self {
+            tracked_pairs: Vec::new(),
+            current_cycle: 0,
+            full_match_interval,
+            market_limit,
+        }
+    }
+
+    pub fn should_full_match(&self) -> bool {
+        self.current_cycle % self.full_match_interval == 0
+    }
+
+    pub fn next_cycle(&mut self) {
+        self.current_cycle += 1;
+    }
+
+    pub fn update_tracked_pairs(&mut self, new_matches: Vec<(Market, Market, f64)>) {
+        // 标记旧的为不活跃
+        for pair in &mut self.tracked_pairs {
+            pair.active = false;
+        }
+
+        // 添加新的匹配对
+        for (pm, kalshi, similarity) in new_matches {
+            let pair_id = format!("{}:{}", pm.market_id, kalshi.market_id);
+            if let Some(existing) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
+                existing.active = true;
+                existing.similarity = similarity;
+            } else {
+                self.tracked_pairs.push(TrackedArbitrage::new(pm, kalshi, similarity));
+            }
+        }
+
+        // 清理不活跃的
+        self.tracked_pairs.retain(|p| p.active);
+    }
+
+    pub fn get_active_pairs(&self) -> Vec<&TrackedArbitrage> {
+        self.tracked_pairs.iter().filter(|p| p.active).collect()
+    }
+}

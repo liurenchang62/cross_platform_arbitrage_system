@@ -53,48 +53,70 @@ impl VectorIndex {
         Self::new(category_name, TREE_DIMENSION)
     }
 
-    /// 从向量列表构建索引
+    /// 从向量列表构建索引（优化版 - 真正批量构建）
     pub fn build(&mut self, items: Vec<IndexItem>) -> Result<(), kdtree::ErrorKind> {
         if items.is_empty() {
             return Ok(());
         }
 
-        self.clear();
+        let total = items.len();
+        println!("        构建索引: {} 个项", total);
+        let start = std::time::Instant::now();
+
+        // 清空现有数据
+        self.items.clear();
+        self.id_to_idx.clear();
         
-        for item in items {
-            if let Err(e) = self.insert(item) {
-                eprintln!("   ⚠️ 插入失败: {:?}", e);
+        // 确定维度
+        self.dimension = items[0].vector.len();
+        
+        // 批量存储 items
+        self.items = items;
+        
+        // 构建 ID 映射
+        for (idx, item) in self.items.iter().enumerate() {
+            self.id_to_idx.insert(item.id.clone(), idx);
+            if idx % 5000 == 0 && idx > 0 {
+                println!("          构建ID映射: {}/{}", idx, total);
             }
         }
-
-        self.built = true;
-        Ok(())
-    }
-
-    /// 插入单个向量到索引
-    pub fn insert(&mut self, item: IndexItem) -> Result<(), kdtree::ErrorKind> {
-        if self.items.is_empty() {
-            self.dimension = item.vector.len();
-            self.tree = KdTree::new(self.dimension);
+        
+        // 一次性构建 K-D Tree
+        println!("          构建K-D Tree...");
+        let points: Vec<Vec<f64>> = self.items
+            .iter()
+            .map(|item| item.vector.iter().cloned().collect())
+            .collect();
+        
+        self.tree = KdTree::new(self.dimension);
+        
+        for (idx, point) in points.iter().enumerate() {
+            self.tree.add(point.clone(), idx)?;
+            if idx % 5000 == 0 && idx > 0 {
+                println!("          添加点: {}/{}", idx, total);
+            }
         }
         
-        if item.vector.len() != self.dimension {
-            return Ok(());
-        }
-
+        self.built = true;
+        println!("        索引构建完成，耗时: {:?}", start.elapsed());
+        Ok(())
+    }
+        
+    
+    
+    /// 插入单个向量到索引（现在只是添加到列表，不重建树）
+    pub fn insert(&mut self, item: IndexItem) -> Result<(), kdtree::ErrorKind> {
+        // 简单添加到列表，不重建树
         let idx = self.items.len();
         self.id_to_idx.insert(item.id.clone(), idx);
         self.items.push(item);
-
-        let point: Vec<f64> = self.items[idx].vector.iter().cloned().collect();
-        self.tree.add(point, idx)?;
         
-        if !self.built && !self.items.is_empty() {
-            self.built = true;
-        }
-
+        // 标记为未构建，下次查询前需要重建
+        self.built = false;
+        
         Ok(())
     }
+
 
     /// 查找超过相似度阈值的所有向量
     pub fn find_similar_with_threshold(
@@ -118,7 +140,7 @@ impl VectorIndex {
 
         match result {
             Ok(neighbors) => {
-                let original_len = neighbors.len();
+                let _original_len = neighbors.len();
                 
                 let mut results: Vec<_> = neighbors
                     .into_iter()

@@ -1,4 +1,7 @@
-use crate::event::MarketPrices;
+// src/arbitrage_detector.rs
+use crate::market::MarketPrices;
+use serde_json::Value;
+
 
 #[derive(Debug, Clone)]
 pub struct ArbitrageOpportunity {
@@ -10,11 +13,6 @@ pub struct ArbitrageOpportunity {
     pub fees: f64,
     pub net_profit: f64,
     pub roi_percent: f64,
-}
-
-pub struct ArbitrageDetector {
-    min_profit_threshold: f64,
-    fees: Fees,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +30,11 @@ impl Default for Fees {
     }
 }
 
+pub struct ArbitrageDetector {
+    min_profit_threshold: f64,
+    fees: Fees,
+}
+
 impl ArbitrageDetector {
     pub fn new(min_profit_threshold: f64) -> Self {
         Self {
@@ -44,8 +47,6 @@ impl ArbitrageDetector {
         self.fees = fees;
         self
     }
-
-
 
     pub fn check_arbitrage_optimal(
         &self,
@@ -128,28 +129,29 @@ impl ArbitrageDetector {
         None
     }
 
-
-
-
-
-    
+    // 兼容旧调用
+    pub fn check_arbitrage(
+        &self,
+        pm_prices: &MarketPrices,
+        kalshi_prices: &MarketPrices,
+    ) -> Option<ArbitrageOpportunity> {
+        self.check_arbitrage_optimal(pm_prices, kalshi_prices)
+    }
 }
 
-
-/// 滑点计算结果
+// 滑点计算相关函数
 #[derive(Debug, Clone)]
 pub struct SlippageInfo {
-    pub avg_price: f64,        // 平均成交价
-    pub slippage_percent: f64, // 滑点百分比
-    pub filled: bool,           // 是否完全成交
-    pub filled_amount: f64,     // 实际成交的USDT金额
-    pub filled_contracts: f64,  // 实际成交的合约数
+    pub avg_price: f64,
+    pub slippage_percent: f64,
+    pub filled: bool,
+    pub filled_amount: f64,
+    pub filled_contracts: f64,
 }
 
-/// 根据固定USDT金额计算滑点
 pub fn calculate_slippage_with_fixed_usdt(
-    asks: &[(f64, f64)],  // (价格, 数量) 数组，已按价格升序
-    usdt_amount: f64,      // 固定投入金额，比如 100 USDT
+    asks: &[(f64, f64)],
+    usdt_amount: f64,
 ) -> SlippageInfo {
     let mut remaining_usdt = usdt_amount;
     let mut total_contracts = 0.0;
@@ -157,16 +159,13 @@ pub fn calculate_slippage_with_fixed_usdt(
     let best_price = if asks.is_empty() { 0.0 } else { asks[0].0 };
     
     for (price, size) in asks {
-        // 这一档的总价值 = 价格 × 数量
         let level_value = price * size;
         
         if remaining_usdt >= level_value {
-            // 可以吃掉整档
             total_contracts += size;
             total_cost += level_value;
             remaining_usdt -= level_value;
         } else {
-            // 只能吃部分
             let buy_size = remaining_usdt / price;
             total_contracts += buy_size;
             total_cost += remaining_usdt;
@@ -204,115 +203,65 @@ pub fn calculate_slippage_with_fixed_usdt(
     }
 }
 
-
-
-/// 解析Polymarket订单簿，根据方向返回对应的asks
-pub fn parse_polymarket_orderbook(data: &serde_json::Value, side: &str) -> Option<Vec<(f64, f64)>> {
-    match side {
-        "YES" => {
-            // 买 YES：直接取 asks（YES 的卖单）
-            let asks = data.get("asks")?.as_array()?;
-            let mut result = Vec::new();
-            
-            for ask in asks {
-                let price = ask.get("price")?.as_str()?.parse::<f64>().ok()?;
-                let size = ask.get("size")?.as_str()?.parse::<f64>().ok()?;
-                result.push((price, size));
+pub fn parse_polymarket_orderbook(data: &Value, side: &str) -> Option<Vec<(f64, f64)>> {
+    if side == "YES" {
+        let asks = data.get("asks")?.as_array()?;
+        let mut result = Vec::new();
+        for ask in asks {
+            let price = ask.get("price")?.as_str()?.parse::<f64>().ok()?;
+            let size = ask.get("size")?.as_str()?.parse::<f64>().ok()?;
+            result.push((price, size));
+        }
+        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        Some(result)
+    } else if side == "NO" {
+        let bids = data.get("bids")?.as_array()?;
+        let mut result = Vec::new();
+        for bid in bids {
+            let bid_price = bid.get("price")?.as_str()?.parse::<f64>().ok()?;
+            let size = bid.get("size")?.as_str()?.parse::<f64>().ok()?;
+            let ask_price = 1.0 - bid_price;
+            if ask_price > 0.01 && ask_price < 1.0 {
+                result.push((ask_price, size));
             }
-            
-            // 确保按价格升序
-            result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            Some(result)
-        },
-        "NO" => {
-            // 买 NO：需要从 bids 转换（NO 卖价 = 1 - YES 买价）
-            let bids = data.get("bids")?.as_array()?;
-            let mut result = Vec::new();
-            
-            for bid in bids {
-                let bid_price = bid.get("price")?.as_str()?.parse::<f64>().ok()?;
-                let size = bid.get("size")?.as_str()?.parse::<f64>().ok()?;
-                
-                // NO 的卖价 = 1 - YES 的买价
-                let ask_price = 1.0 - bid_price;
-                // 只保留合理价格
-                if ask_price > 0.01 && ask_price < 1.0 {
-                    result.push((ask_price, size));
-                }
-            }
-            
-            // 按价格升序（从最便宜的 NO 卖单开始）
-            result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            Some(result)
-        },
-        _ => None,
+        }
+        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        Some(result)
+    } else {
+        None
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-/// 解析Kalshi订单簿，返回指定方向的 asks（卖单）
-pub fn parse_kalshi_orderbook(
-    data: &serde_json::Value, 
-    side: &str  // "YES" 或 "NO"
-) -> Option<Vec<(f64, f64)>> {
+pub fn parse_kalshi_orderbook(data: &Value, side: &str) -> Option<Vec<(f64, f64)>> {
     let orderbook = data.get("orderbook_fp")?;
     
-    match side {
-        "YES" => {
-            // 买 YES 需要用 YES 的卖单，但 Kalshi 只返回 bids
-            // YES 的卖价 = 1 - NO 的买价
-            let no_bids = orderbook.get("no_dollars")?.as_array()?;
-            let mut result = Vec::new();
-            
-            for entry in no_bids {
-                let price_str = entry.get(0)?.as_str()?;
-                let size_str = entry.get(1)?.as_str()?;
-                let bid_price = price_str.parse::<f64>().ok()?;
-                let size = size_str.parse::<f64>().ok()?;
-                
-                // NO 的买单价格对应的 YES 卖价
-                let ask_price = 1.0 - bid_price;
-                // 只保留合理价格 (>0.01) 并确保价格为正
-                if ask_price > 0.01 && ask_price < 1.0 {
-                    result.push((ask_price, size));
-                }
+    if side == "YES" {
+        let no_bids = orderbook.get("no_dollars")?.as_array()?;
+        let mut result = Vec::new();
+        for entry in no_bids {
+            let bid_price = entry.get(0)?.as_str()?.parse::<f64>().ok()?;
+            let size = entry.get(1)?.as_str()?.parse::<f64>().ok()?;
+            let ask_price = 1.0 - bid_price;
+            if ask_price > 0.01 && ask_price < 1.0 {
+                result.push((ask_price, size));
             }
-            
-            result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            Some(result)
-        },
-        "NO" => {
-            // 买 NO 需要用 NO 的卖单，但 Kalshi 只返回 bids
-            // NO 的卖价 = 1 - YES 的买价
-            let yes_bids = orderbook.get("yes_dollars")?.as_array()?;
-            let mut result = Vec::new();
-            
-            for entry in yes_bids {
-                let price_str = entry.get(0)?.as_str()?;
-                let size_str = entry.get(1)?.as_str()?;
-                let bid_price = price_str.parse::<f64>().ok()?;
-                let size = size_str.parse::<f64>().ok()?;
-                
-                // YES 的买单价格对应的 NO 卖价
-                let ask_price = 1.0 - bid_price;
-                // 只保留合理价格 (>0.01) 并确保价格为正
-                if ask_price > 0.01 && ask_price < 1.0 {
-                    result.push((ask_price, size));
-                }
+        }
+        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        Some(result)
+    } else if side == "NO" {
+        let yes_bids = orderbook.get("yes_dollars")?.as_array()?;
+        let mut result = Vec::new();
+        for entry in yes_bids {
+            let bid_price = entry.get(0)?.as_str()?.parse::<f64>().ok()?;
+            let size = entry.get(1)?.as_str()?.parse::<f64>().ok()?;
+            let ask_price = 1.0 - bid_price;
+            if ask_price > 0.01 && ask_price < 1.0 {
+                result.push((ask_price, size));
             }
-            
-            result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            Some(result)
-        },
-        _ => None,
+        }
+        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        Some(result)
+    } else {
+        None
     }
 }

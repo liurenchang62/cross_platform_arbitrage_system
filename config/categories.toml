@@ -134,7 +134,49 @@ keywords = [
     "bulls",
     "playoffs",
     "rookie",
-    "all star"
+    "all star",
+    "points",
+    "assists",
+    "rebounds",
+    "jalen",
+    "victor",
+    "derrick",
+    "jayson",
+    "tatum",
+    "brown",
+    "donovan",
+    "clingan",
+    "mathurin",
+    "bennedict",
+    "deni",
+    "reed",
+    "suggs",
+    "darius",
+    "cooper",
+    "reaves",
+    "wembanyama",
+    "mccollum",
+    "castle",
+    "pritchard",
+    "alexander-walker",
+    "jaylen",
+    "smith",
+    "paolo",
+    "banchero",
+    "claxton",
+    "amen",
+    "eason",
+    "nickeil",
+    "davis",
+    "payton",
+    "johnson",
+    "herbert",
+    "young",
+    "donovan",
+    "josh",
+    "buzelis",
+    "matas",
+    "austin"
 ]
 
 [[categories]]
@@ -154,28 +196,6 @@ keywords = [
     "49ers",
     "pro bowl",
     "draft"
-]
-
-[[categories]]
-name = "weather"
-weight = 1.0
-description = "天气相关"
-keywords = [
-    "weather",
-    "hurricane",
-    "tornado",
-    "storm",
-    "flood",
-    "drought",
-    "temperature",
-    "record high",
-    "record low",
-    "snow",
-    "rain",
-    "climate",
-    "global warming",
-    "el nino",
-    "la nina"
 ]
 
 [[categories]]
@@ -200,8 +220,141 @@ keywords = [
     "chelsea",
     "bayern",
     "juventus",
-    "psg"
+    "psg",
+    "goal",
+    "goals",
+    "liga",
+    "ligue",
+    "serie",
+    "bundesliga",
+    "qualify",
+    "league",
+    "ballon",
+    "d'or",
+    "calder",
+    "selke",
+    "vezina"
 ]
+
+[[categories]]
+name = "sports_golf"
+weight = 1.0
+description = "高尔夫"
+keywords = [
+    "golf",
+    "valspar",
+    "memorial",
+    "round",
+    "finish",
+    "lead",
+    "scorer",
+    "trophy",
+    "championship",
+    "masters",
+    "open"
+]
+
+[[categories]]
+name = "sports_teams"
+weight = 1.0
+description = "体育队伍/城市"
+keywords = [
+    "miami",
+    "washington",
+    "houston",
+    "boston",
+    "chicago",
+    "dallas",
+    "brooklyn",
+    "atlanta",
+    "philadelphia",
+    "portland",
+    "golden",
+    "calgary",
+    "toronto",
+    "angeles",
+    "orleans",
+    "san antonio",
+    "new york",
+    "north carolina",
+    "south carolina",
+    "texas",
+    "arizona",
+    "colorado",
+    "illinois",
+    "virginia",
+    "alabama",
+    "kentucky",
+    "iowa",
+    "kansas"
+]
+
+[[categories]]
+name = "sports_college"
+weight = 1.0
+description = "大学体育"
+keywords = [
+    "villanova",
+    "ucla",
+    "ohio",
+    "uconn",
+    "nebraska",
+    "vanderbilt",
+    "umbc"
+]
+
+[[categories]]
+name = "sports_other"
+weight = 1.0
+description = "其他体育相关"
+keywords = [
+    "winner",
+    "wins",
+    "season",
+    "player",
+    "team",
+    "final",
+    "match",
+    "scored",
+    "points",
+    "over",
+    "under",
+    "total",
+    "above",
+    "half",
+    "first",
+    "double",
+    "threes",
+    "regular",
+    "standings",
+    "rank",
+    "award",
+    "championship",
+    "trophy"
+]
+
+[[categories]]
+name = "weather"
+weight = 1.0
+description = "天气相关"
+keywords = [
+    "weather",
+    "hurricane",
+    "tornado",
+    "storm",
+    "flood",
+    "drought",
+    "temperature",
+    "record high",
+    "record low",
+    "snow",
+    "rain",
+    "climate",
+    "global warming",
+    "el nino",
+    "la nina"
+]
+
 [[categories]]
 name = "entertainment_movies"
 weight = 1.0
@@ -307,20 +460,3 @@ keywords = [
     "global warming"
 ]
 
-[[categories]]
-name = "weather"
-weight = 1.0
-description = "天气"
-keywords = [
-    "hurricane",
-    "tornado",
-    "storm",
-    "flood",
-    "drought",
-    "temperature",
-    "record high",
-    "record low",
-    "snow",
-    "rain",
-    "weather"
-]

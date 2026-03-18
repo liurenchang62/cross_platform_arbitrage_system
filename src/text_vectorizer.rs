@@ -26,7 +26,7 @@ fn get_stop_words() -> HashSet<&'static str> {
         // 预测市场常见无意义词
         "will", "be", "the", "market", "price", "prediction", "event", "outcome",
         "contract", "share", "stock", "binary", "option", "trade", "trading",
-        "buy", "sell", "yes", "no", "up", "down", "over", "under",
+        "buy", "sell", "yes", "no", "up", "down", "over", "under","points","point","round"
     ] {
         set.insert(*word);
     }
@@ -59,8 +59,8 @@ impl Default for VectorizerConfig {
             use_stemming: true,
             filter_stop_words: true,
             min_word_length: 2,
-            max_df_ratio: 0.8,  // 出现在超过80%文档中的词忽略
-            min_df: 1,           // 至少出现在1个文档中
+            max_df_ratio: 0.8,
+            min_df: 1,
             normalize: true,
             custom_stop_words: HashSet::new(),
         }
@@ -90,8 +90,6 @@ impl std::fmt::Debug for StemmerWrapper {
 // 手动实现 Clone
 impl Clone for StemmerWrapper {
     fn clone(&self) -> Self {
-        // Stemmer 没有提供 Clone trait，但我们可以重新创建
-        // 注意：这只是一个近似，因为无法获取原始算法
         Self(Stemmer::create(Algorithm::English))
     }
 }
@@ -226,7 +224,7 @@ impl TextVectorizer {
             all_tokens.push(self.tokenize(doc));
         }
         
-        // 第二步：统计词频和文档频率
+        // 第二步：统计文档频率
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
         
         for tokens in &all_tokens {
@@ -313,7 +311,6 @@ impl TextVectorizer {
         // 计算 TF-IDF
         for (idx, &idf_value) in self.idf.iter().enumerate() {
             if vector[idx] > 0.0 {
-                // TF 使用原始词频（也可以使用 log 归一化，但这里保持简单）
                 vector[idx] *= idf_value;
             }
         }
