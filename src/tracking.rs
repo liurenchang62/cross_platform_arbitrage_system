@@ -1,4 +1,4 @@
-// tracking.rs
+// src/tracking.rs
 use chrono::{DateTime, Utc};
 use crate::market::{Market, MarketPrices};
 
@@ -8,6 +8,9 @@ pub struct TrackedArbitrage {
     pub pm_market: Market,
     pub kalshi_market: Market,
     pub similarity: f64,
+    pub pm_side: String,
+    pub kalshi_side: String,
+    pub needs_inversion: bool,
     pub last_pm_price: Option<MarketPrices>,
     pub last_kalshi_price: Option<MarketPrices>,
     pub best_profit: f64,
@@ -16,12 +19,22 @@ pub struct TrackedArbitrage {
 }
 
 impl TrackedArbitrage {
-    pub fn new(pm_market: Market, kalshi_market: Market, similarity: f64) -> Self {
+    pub fn new(
+        pm_market: Market, 
+        kalshi_market: Market, 
+        similarity: f64,
+        pm_side: String,
+        kalshi_side: String,
+        needs_inversion: bool,
+    ) -> Self {
         Self {
             pair_id: format!("{}:{}", pm_market.market_id, kalshi_market.market_id),
             pm_market,
             kalshi_market,
             similarity,
+            pm_side,
+            kalshi_side,
+            needs_inversion,
             last_pm_price: None,
             last_kalshi_price: None,
             best_profit: 0.0,
@@ -57,20 +70,25 @@ impl MonitorState {
         self.current_cycle += 1;
     }
 
-    pub fn update_tracked_pairs(&mut self, new_matches: Vec<(Market, Market, f64)>) {
+    pub fn update_tracked_pairs(&mut self, new_matches: Vec<(Market, Market, f64, String, String, bool)>) {
         // 标记旧的为不活跃
         for pair in &mut self.tracked_pairs {
             pair.active = false;
         }
 
         // 添加新的匹配对
-        for (pm, kalshi, similarity) in new_matches {
+        for (pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion) in new_matches {
             let pair_id = format!("{}:{}", pm.market_id, kalshi.market_id);
             if let Some(existing) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
                 existing.active = true;
                 existing.similarity = similarity;
+                existing.pm_side = pm_side;
+                existing.kalshi_side = kalshi_side;
+                existing.needs_inversion = needs_inversion;
             } else {
-                self.tracked_pairs.push(TrackedArbitrage::new(pm, kalshi, similarity));
+                self.tracked_pairs.push(TrackedArbitrage::new(
+                    pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion
+                ));
             }
         }
 

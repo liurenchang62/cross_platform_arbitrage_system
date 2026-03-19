@@ -8,9 +8,10 @@ use crate::query_params::SIMILARITY_THRESHOLD;
 use crate::category_vectorizer::{CategoryVectorizerManager};
 use crate::text_vectorizer::VectorizerConfig;
 use crate::validation::ValidationPipeline;
-use tokio::join;
+use tokio::task;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
@@ -62,10 +63,11 @@ pub struct MarketMatcher {
     pub config: MarketMatcherConfig,
     pub category_mapper: CategoryMapper,
     pub unclassified_logger: Option<UnclassifiedLogger>,
-    pub kalshi_vectorizers: CategoryVectorizerManager,
-    pub polymarket_vectorizers: CategoryVectorizerManager,
+    pub kalshi_vectorizers: Arc<CategoryVectorizerManager>,
+    pub polymarket_vectorizers: Arc<CategoryVectorizerManager>,
     pub fitted: bool,
-    market_cache: HashMap<String, Market>,
+    kalshi_market_cache: Arc<HashMap<String, Market>>,
+    polymarket_market_cache: Arc<HashMap<String, Market>>,
     pub validation_pipeline: ValidationPipeline,
 }
 
@@ -75,10 +77,11 @@ impl MarketMatcher {
             config,
             category_mapper,
             unclassified_logger: None,
-            kalshi_vectorizers: CategoryVectorizerManager::new(),
-            polymarket_vectorizers: CategoryVectorizerManager::new(),
+            kalshi_vectorizers: Arc::new(CategoryVectorizerManager::new()),
+            polymarket_vectorizers: Arc::new(CategoryVectorizerManager::new()),
             fitted: false,
-            market_cache: HashMap::new(),
+            kalshi_market_cache: Arc::new(HashMap::new()),
+            polymarket_market_cache: Arc::new(HashMap::new()),
             validation_pipeline: ValidationPipeline::new(),
         }
     }
@@ -113,11 +116,15 @@ impl MarketMatcher {
             }
         }
         
+        // 需要获取可变引用
+        let kalshi_vec = Arc::get_mut(&mut self.kalshi_vectorizers).unwrap();
+        let polymarket_vec = Arc::get_mut(&mut self.polymarket_vectorizers).unwrap();
+        
         println!("   📊 训练 Kalshi 类别向量化器...");
-        self.kalshi_vectorizers.fit_all(kalshi_by_category);
+        kalshi_vec.fit_all(kalshi_by_category);
         
         println!("   📊 训练 Polymarket 类别向量化器...");
-        self.polymarket_vectorizers.fit_all(polymarket_by_category);
+        polymarket_vec.fit_all(polymarket_by_category);
         
         self.fitted = true;
         Ok(())
@@ -131,10 +138,11 @@ impl MarketMatcher {
         println!("📊 构建 Kalshi 市场索引...");
         
         let mut by_category: HashMap<String, Vec<(String, String, Option<Value>)>> = HashMap::new();
+        let mut cache = HashMap::new();
         
         for market in markets {
             let market_id = format!("{}:{}", market.platform, market.market_id);
-            self.market_cache.insert(market_id.clone(), market.clone());
+            cache.insert(market_id.clone(), market.clone());
             
             let categories = self.category_mapper.classify(&market.title);
             let data = Some(serde_json::json!({
@@ -162,13 +170,17 @@ impl MarketMatcher {
             }
         }
         
+        // 注意：必须分别缓存两边市场，否则后一次 build_* 会覆盖，导致某个方向 0 匹配
+        self.kalshi_market_cache = Arc::new(cache);
+        
+        let kalshi_vec = Arc::get_mut(&mut self.kalshi_vectorizers).unwrap();
         for (category, items) in by_category {
-            if let Some(vectorizer) = self.kalshi_vectorizers.get_or_create(&category) {
+            if let Some(vectorizer) = kalshi_vec.get_or_create(&category) {
                 vectorizer.add_markets_batch(items)?;
             }
         }
         
-        println!("   ✅ Kalshi 索引构建完成，总市场数: {}", self.kalshi_vectorizers.total_size());
+        println!("   ✅ Kalshi 索引构建完成，总市场数: {}", kalshi_vec.total_size());
         Ok(())
     }
 
@@ -180,10 +192,11 @@ impl MarketMatcher {
         println!("📊 构建 Polymarket 市场索引...");
         
         let mut by_category: HashMap<String, Vec<(String, String, Option<Value>)>> = HashMap::new();
+        let mut cache = HashMap::new();
         
         for market in markets {
             let market_id = format!("{}:{}", market.platform, market.market_id);
-            self.market_cache.insert(market_id.clone(), market.clone());
+            cache.insert(market_id.clone(), market.clone());
             
             let categories = self.category_mapper.classify(&market.title);
             let data = Some(serde_json::json!({
@@ -211,21 +224,34 @@ impl MarketMatcher {
             }
         }
         
+        self.polymarket_market_cache = Arc::new(cache);
+        
+        let polymarket_vec = Arc::get_mut(&mut self.polymarket_vectorizers).unwrap();
         for (category, items) in by_category {
-            if let Some(vectorizer) = self.polymarket_vectorizers.get_or_create(&category) {
+            if let Some(vectorizer) = polymarket_vec.get_or_create(&category) {
                 vectorizer.add_markets_batch(items)?;
             }
         }
         
-        println!("   ✅ Polymarket 索引构建完成，总市场数: {}", self.polymarket_vectorizers.total_size());
+        println!("   ✅ Polymarket 索引构建完成，总市场数: {}", polymarket_vec.total_size());
         Ok(())
     }
+
+
+
+
+
+
+
+
+
+    // 在 find_matches_bidirectional 函数中修改调用和合并逻辑
 
     pub async fn find_matches_bidirectional(
         &mut self,
         pm_markets: &[Market],
         kalshi_markets: &[Market],
-    ) -> Vec<(Market, Market, f64)> {
+    ) -> Vec<(Market, Market, f64, String, String, bool)> {  // 修改返回类型
         if !self.fitted {
             println!("⚠️ 索引未构建");
             return Vec::new();
@@ -235,60 +261,92 @@ impl MarketMatcher {
 
         println!("\n🔍 ====== 开始双向匹配 ======");
         
-        // 创建两个独立的验证管道
-        let mut pipeline1 = ValidationPipeline::new();
-        let mut pipeline2 = ValidationPipeline::new();
+        // 克隆需要的数据用于并行任务
+        let kalshi_vec = self.kalshi_vectorizers.clone();
+        let polymarket_vec = self.polymarket_vectorizers.clone();
+        
+        let category_mapper1 = self.category_mapper.clone();
+        let category_mapper2 = self.category_mapper.clone();
+        
+        let config1 = self.config.clone();
+        let config2 = self.config.clone();
+        
+        // 方向1（PM→Kalshi）查询 Kalshi 索引，必须用 Kalshi cache 才能用 item.id 命中目标市场
+        let market_cache1 = self.kalshi_market_cache.clone();
+        // 方向2（Kalshi→PM）查询 PM 索引，必须用 PM cache
+        let market_cache2 = self.polymarket_market_cache.clone();
+        
+        let pm_markets_vec = pm_markets.to_vec();
+        let kalshi_markets_vec = kalshi_markets.to_vec();
         
         let start_time = std::time::Instant::now();
         
         println!("\n📌 并行执行两个方向...");
         
         // 真正的并行执行
-        let (matches1, matches2) = tokio::join!(
-            Self::find_matches_directional(
-                pm_markets,
-                &self.kalshi_vectorizers,
-                &self.category_mapper,
-                &self.config,
-                &self.market_cache,
-                &mut pipeline1,
-            ),
-            Self::find_matches_directional(
-                kalshi_markets,
-                &self.polymarket_vectorizers,
-                &self.category_mapper,
-                &self.config,
-                &self.market_cache,
-                &mut pipeline2,
-            )
-        );
+        let handle1 = task::spawn(async move {
+            let mut pipeline = ValidationPipeline::new();
+            let matches = Self::find_matches_directional_internal(
+                &pm_markets_vec,
+                &kalshi_vec,
+                &category_mapper1,
+                &config1,
+                &market_cache1,
+                &mut pipeline,
+                "PM→Kalshi",  // 方向标识
+            ).await;
+            (matches, pipeline)
+        });
+        
+        let handle2 = task::spawn(async move {
+            let mut pipeline = ValidationPipeline::new();
+            let matches = Self::find_matches_directional_internal(
+                &kalshi_markets_vec,
+                &polymarket_vec,
+                &category_mapper2,
+                &config2,
+                &market_cache2,
+                &mut pipeline,
+                "Kalshi→PM",  // 方向标识
+            ).await;
+            (matches, pipeline)
+        });
+        
+        let (res1, res2) = tokio::join!(handle1, handle2);
+        
+        let (matches1, pipeline1) = res1.unwrap();
+        let (matches2, pipeline2) = res2.unwrap();
         
         let initial_count = matches1.len() + matches2.len();
         
         let mut all_matches = Vec::new();
         let mut seen_pairs = std::collections::HashSet::new();
         
-        for (m1, m2, score) in matches1 {
+        // 处理方向1的匹配 (PM→Kalshi)
+        for (m1, m2, score, pm_side, ks_side, needs_inversion) in matches1 {
             let pair_key = format!("{}:{}", m1.market_id, m2.market_id);
             let reverse_key = format!("{}:{}", m2.market_id, m1.market_id);
             
             if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
                 seen_pairs.insert(pair_key);
                 if m1.platform == "polymarket" && m2.platform == "kalshi" {
-                    all_matches.push((m1, m2, score));
+                    all_matches.push((m1, m2, score, pm_side, ks_side, needs_inversion));
                 } else {
-                    all_matches.push((m2, m1, score));
+                    // 如果方向反了，交换并保留方向信息
+                    all_matches.push((m2, m1, score, pm_side, ks_side, needs_inversion));
                 }
             }
         }
         
-        for (m1, m2, score) in matches2 {
+        // 处理方向2的匹配 (Kalshi→PM)
+        for (m1, m2, score, pm_side, ks_side, needs_inversion) in matches2 {
             let pair_key = format!("{}:{}", m2.market_id, m1.market_id);
             let reverse_key = format!("{}:{}", m1.market_id, m2.market_id);
             
             if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
                 seen_pairs.insert(pair_key);
-                all_matches.push((m2, m1, score));
+                // 方向2中，m1是Kalshi，m2是PM，需要交换并保留方向信息
+                all_matches.push((m2, m1, score, pm_side, ks_side, needs_inversion));
             }
         }
         
@@ -299,6 +357,7 @@ impl MarketMatcher {
         
         self.validation_pipeline.filtered_count = filtered_count;
         
+        // 合并留存样本
         for (cat, samples) in pipeline1.retained_samples {
             self.validation_pipeline.retained_samples.insert(cat, samples);
         }
@@ -318,18 +377,27 @@ impl MarketMatcher {
         all_matches
     }
 
-    async fn find_matches_directional(
+
+
+
+
+
+
+    // 在 find_matches_directional_internal 函数中修改调用部分
+
+    async fn find_matches_directional_internal(
         query_markets: &[Market],
         target_vectorizers: &CategoryVectorizerManager,
         category_mapper: &CategoryMapper,
         config: &MarketMatcherConfig,
-        market_cache: &HashMap<String, Market>,
+        target_market_cache: &HashMap<String, Market>,
         validation_pipeline: &mut ValidationPipeline,
-    ) -> Vec<(Market, Market, f64)> {
+        direction_label: &str,  // 新增：方向标识
+    ) -> Vec<(Market, Market, f64, String, String, bool)> {  // 返回更多信息
         let mut all_matches = Vec::new();
         let total = query_markets.len();
         
-        println!("      🔍 匹配 {} 个市场...", total);
+        println!("      🔍 匹配 {} 个市场 [{}]...", total, direction_label);
         let start_time = std::time::Instant::now();
         
         for (idx, query_market) in query_markets.iter().enumerate() {
@@ -337,8 +405,8 @@ impl MarketMatcher {
                 let elapsed = start_time.elapsed();
                 let avg_time = elapsed.as_millis() as f64 / idx as f64;
                 let remaining = (total - idx) as f64 * avg_time;
-                println!("        进度: {}/{} 个市场, 已用 {:?}, 预计剩余 {:?}", 
-                    idx, total, 
+                println!("        进度: {}/{} 个市场 [{}], 已用 {:?}, 预计剩余 {:?}", 
+                    idx, total, direction_label,
                     humantime::format_duration(elapsed),
                     humantime::format_duration(std::time::Duration::from_millis(remaining as u64)));
             }
@@ -354,29 +422,36 @@ impl MarketMatcher {
                     );
                     
                     for (item, similarity) in similar {
-                        if let Some(target_market) = market_cache.get(&item.id) {
-                            if !validation_pipeline.validate(
-                                &query_market.title, 
-                                &target_market.title,
+                        if let Some(target_market) = target_market_cache.get(&item.id) {
+                            // 二筛始终需要 (pm_title, kalshi_title)；Kalshi→PM 方向时 query=Kalshi target=PM，需交换
+                            let (pm_title, kalshi_title) = if direction_label == "Kalshi→PM" {
+                                (&target_market.title, &query_market.title)
+                            } else {
+                                (&query_market.title, &target_market.title)
+                            };
+                            if let Some(match_info) = validation_pipeline.validate(
+                                pm_title,
+                                kalshi_title,
                                 similarity,
                                 &category,
                             ) {
-                                continue;
-                            }
-                            
-                            let confidence = Self::calculate_confidence(
-                                query_market,
-                                target_market,
-                                similarity,
-                                config,
-                            );
-                            
-                            if confidence.overall_score >= config.similarity_threshold {
-                                all_matches.push((
-                                    query_market.clone(),
-                                    target_market.clone(),
-                                    confidence.overall_score,
-                                ));
+                                let confidence = Self::calculate_confidence(
+                                    query_market,
+                                    target_market,
+                                    similarity,
+                                    config,
+                                );
+                                
+                                if confidence.overall_score >= config.similarity_threshold {
+                                    all_matches.push((
+                                        query_market.clone(),
+                                        target_market.clone(),
+                                        confidence.overall_score,
+                                        match_info.pm_side,
+                                        match_info.kalshi_side,
+                                        match_info.needs_inversion,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -385,10 +460,13 @@ impl MarketMatcher {
         }
         
         let elapsed = start_time.elapsed();
-        println!("        匹配完成，耗时: {:?}", elapsed);
+        println!("        匹配完成 [{}], 耗时: {:?}, 找到 {} 个匹配", 
+            direction_label, elapsed, all_matches.len());
         
         all_matches
     }
+
+
 
     fn calculate_confidence(
         market1: &Market,

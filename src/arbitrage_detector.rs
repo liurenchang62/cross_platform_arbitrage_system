@@ -54,6 +54,76 @@ impl ArbitrageDetector {
         self
     }
 
+    // 在 ArbitrageDetector 中添加新方法
+
+    pub fn calculate_arbitrage_with_direction(
+        &self,
+        pm_prices: &MarketPrices,
+        kalshi_prices: &MarketPrices,
+        pm_side: &str,
+        kalshi_side: &str,
+        needs_inversion: bool,
+    ) -> Option<ArbitrageOpportunity> {
+        // 根据方向确定实际买卖
+        let (pm_action, pm_price) = if pm_side == "YES" {
+            ("BUY", pm_prices.yes_ask.unwrap_or(pm_prices.yes))
+        } else {
+            ("BUY", pm_prices.no_ask.unwrap_or(pm_prices.no))
+        };
+        
+        let (kalshi_action, kalshi_price) = if kalshi_side == "YES" {
+            ("BUY", kalshi_prices.yes_ask.unwrap_or(kalshi_prices.yes))
+        } else {
+            ("BUY", kalshi_prices.no_ask.unwrap_or(kalshi_prices.no))
+        };
+        
+        // 计算成本
+        let total_cost = pm_price + kalshi_price;
+        let profit = 1.0 - total_cost;
+        let total_fees = self.fees.polymarket + self.fees.kalshi;
+        
+        if profit <= total_fees + self.min_profit_threshold {
+            return None;
+        }
+        
+        let net_profit = profit - total_fees;
+        let final_profit = net_profit - GAS_FEE;
+        
+        if final_profit <= self.min_profit_threshold {
+            return None;
+        }
+        
+        let roi = if total_cost > 0.0 {
+            (final_profit / total_cost) * 100.0
+        } else {
+            0.0
+        };
+        
+        // 构建策略描述
+        let inversion_note = if needs_inversion {
+            " [Y/N颠倒]"
+        } else {
+            ""
+        };
+        
+        let strategy = format!("Buy {} on Polymarket + Buy {} on Kalshi{}", 
+            pm_side, kalshi_side, inversion_note);
+        
+        Some(ArbitrageOpportunity {
+            strategy,
+            kalshi_action: (kalshi_action.to_string(), kalshi_side.to_string(), kalshi_price),
+            polymarket_action: (pm_action.to_string(), pm_side.to_string(), pm_price),
+            total_cost,
+            gross_profit: profit,
+            fees: total_fees,
+            net_profit,
+            roi_percent: roi,
+            gas_fee: GAS_FEE,
+            final_profit,
+            final_roi_percent: roi,
+        })
+    }
+
     pub fn calculate_final_profit(
         &self,
         pm_prices: &MarketPrices,
