@@ -1,13 +1,64 @@
 use crate::market::{Market, MarketPrices};
 use crate::query_params::*;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+
+/// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）为主；仅日历日时有 `endDateIso`。
+pub(crate) fn parse_polymarket_market_resolution_date(market_data: &Value) -> Option<DateTime<Utc>> {
+    for key in ["endDate", "end_date"] {
+        if let Some(s) = market_data[key].as_str() {
+            if s.is_empty() {
+                continue;
+            }
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                return Some(dt.with_timezone(&Utc));
+            }
+        }
+    }
+    if let Some(s) = market_data["endDateIso"].as_str() {
+        if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let ndt = d.and_hms_opt(0, 0, 0)?;
+            return Some(Utc.from_utc_datetime(&ndt));
+        }
+    }
+    None
+}
+
+fn parse_rfc3339_field(market_data: &Value, key: &str) -> Option<DateTime<Utc>> {
+    if market_data[key].is_null() {
+        return None;
+    }
+    let s = market_data[key].as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Kalshi 列表/详情：优先 **`expected_expiration_time`**（接近「赛果/事件可判定」时刻，便于与 Polymarket `endDate` 对齐）；
+/// 再依次 `expiration_time`、`close_time`；**`latest_expiration_time` 置末**（规则上的最晚窗口，常与真实赛日相差甚远）。
+pub(crate) fn parse_kalshi_market_resolution_date(market_data: &Value) -> Option<DateTime<Utc>> {
+    for key in [
+        "expected_expiration_time",
+        "expiration_time",
+        "close_time",
+        "latest_expiration_time",
+    ] {
+        if let Some(dt) = parse_rfc3339_field(market_data, key) {
+            return Some(dt);
+        }
+    }
+    None
+}
 
 
 
@@ -258,10 +309,7 @@ impl PolymarketClient {
                             }
                         }
 
-                        let resolution_date = market_data["endDate"]
-                            .as_str()
-                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                            .map(|dt| dt.with_timezone(&Utc));
+                        let resolution_date = parse_polymarket_market_resolution_date(market_data);
 
                         let market = Market {
                             platform: "polymarket".to_string(),
@@ -321,6 +369,27 @@ impl PolymarketClient {
 
         self.price_cache.set(market.market_id.clone(), prices.clone()).await;
         Ok(prices)
+    }
+
+    /// Gamma `GET /markets?id=...&limit=1`：补全 `Market.resolution_date`（线上响应为 JSON 数组）
+    pub async fn fetch_resolution_by_market_id(&self, market_id: &str) -> Option<DateTime<Utc>> {
+        if market_id.is_empty() {
+            return None;
+        }
+        let url = format!("{}/markets", Self::GAMMA_API_BASE);
+        let response = self
+            .http_client
+            .get(&url)
+            .query(&[("id", market_id), ("limit", "1")])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let arr: Vec<Value> = response.json().await.ok()?;
+        arr.first()
+            .and_then(|m| parse_polymarket_market_resolution_date(m))
     }
 
     pub async fn get_order_book(&self, token_id: &str) -> Result<Option<serde_json::Value>> {
@@ -491,13 +560,7 @@ impl KalshiClient {
                         let market_ticker = market_data["ticker"].as_str().unwrap_or("").to_string();
                         let _event_ticker = market_data["event_ticker"].as_str().unwrap_or("").to_string();
                         
-                        // 解析到期日
-                        let mut resolution_date = None;
-                        if let Some(exp_time) = market_data["expiration_time"].as_str() {
-                            if let Ok(dt) = DateTime::parse_from_rfc3339(exp_time) {
-                                resolution_date = Some(dt.with_timezone(&Utc));
-                            }
-                        }
+                        let resolution_date = parse_kalshi_market_resolution_date(&market_data);
                         
                         // 获取系列对应的 category
                         let event_ticker_str = market_data["event_ticker"].as_str().unwrap_or("");
@@ -677,6 +740,21 @@ impl KalshiClient {
         Ok(None)
     }
 
+    /// `GET /markets/{ticker}`，从响应 `market` 对象解析到期日
+    pub async fn fetch_resolution_by_ticker(&self, ticker: &str) -> Option<DateTime<Utc>> {
+        if ticker.is_empty() {
+            return None;
+        }
+        let url = format!("{}/markets/{}", self.base_url, ticker);
+        let response = self.http_client.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let data: Value = response.json().await.ok()?;
+        data.get("market")
+            .and_then(|m| parse_kalshi_market_resolution_date(m))
+    }
+
     pub async fn get_order_book(&self, ticker: &str) -> Result<Option<serde_json::Value>> {
         let url = format!("{}/markets/{}/orderbook", self.base_url, ticker);
         
@@ -699,5 +777,167 @@ impl KalshiClient {
 impl Default for KalshiClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod resolution_date_field_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn polymarket_uses_enddate_rfc3339() {
+        let market = serde_json::json!({
+            "id": "m1",
+            "endDate": "2026-12-31T23:59:59Z",
+            "question": "test?"
+        });
+        let dt = parse_polymarket_market_resolution_date(&market).expect("endDate 应解析成功");
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).unwrap());
+
+        let with_snake = serde_json::json!({
+            "end_date": "2026-01-02T00:00:00Z",
+        });
+        assert_eq!(
+            parse_polymarket_market_resolution_date(&with_snake)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-01-02T00:00:00+00:00"
+        );
+
+        let wrong = serde_json::json!({
+            "expiration_time": "2026-12-31T23:59:59Z"
+        });
+        assert!(
+            parse_polymarket_market_resolution_date(&wrong).is_none(),
+            "Polymarket 不使用 Kalshi 的 expiration_time"
+        );
+    }
+
+    #[test]
+    fn polymarket_enddate_iso_fallback() {
+        let market = serde_json::json!({"endDateIso": "2027-03-01"});
+        let dt = parse_polymarket_market_resolution_date(&market).unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2027, 3, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn polymarket_enddate_missing_yields_none() {
+        let market = serde_json::json!({"id": "x", "question": "no date"});
+        assert!(parse_polymarket_market_resolution_date(&market).is_none());
+    }
+
+    #[test]
+    fn kalshi_uses_expiration_time_rfc3339() {
+        let market = serde_json::json!({
+            "ticker": "TEST-26",
+            "expiration_time": "2026-06-15T12:00:00-04:00"
+        });
+        let dt = parse_kalshi_market_resolution_date(&market).expect("expiration_time 应解析成功");
+        assert_eq!(dt.to_rfc3339(), "2026-06-15T16:00:00+00:00");
+
+        let wrong = serde_json::json!({
+            "endDate": "2026-06-15T12:00:00Z",
+        });
+        assert!(
+            parse_kalshi_market_resolution_date(&wrong).is_none(),
+            "Kalshi 不使用 Polymarket 的 endDate"
+        );
+    }
+
+    #[test]
+    fn kalshi_prefers_expected_expiration_for_event_end() {
+        let market = serde_json::json!({
+            "expected_expiration_time": "2026-01-01T00:00:00Z",
+            "expiration_time": "2026-03-01T00:00:00Z",
+            "close_time": "2026-03-15T00:00:00Z",
+            "latest_expiration_time": "2026-06-01T00:00:00Z",
+        });
+        let dt = parse_kalshi_market_resolution_date(&market).unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn kalshi_falls_back_past_expected_to_expiration_not_latest() {
+        let market = serde_json::json!({
+            "expiration_time": "2026-03-01T00:00:00Z",
+            "latest_expiration_time": "2026-06-01T00:00:00Z",
+        });
+        let dt = parse_kalshi_market_resolution_date(&market).unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-03-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn kalshi_expiration_time_missing_yields_none() {
+        let market = serde_json::json!({"ticker": "X"});
+        assert!(parse_kalshi_market_resolution_date(&market).is_none());
+    }
+}
+
+/// 真实 API 烟雾测（需外网）：`cargo test live_api_ -- --ignored`
+#[cfg(test)]
+mod live_api_resolution_smoke {
+    use super::*;
+    use reqwest::Client;
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_polymarket_markets_has_resolution_field() {
+        let hc = Client::new();
+        let arr: Vec<Value> = hc
+            .get("https://gamma-api.polymarket.com/markets")
+            .query(&[("limit", "3"), ("active", "true")])
+            .send()
+            .await
+            .expect("Polymarket 网络请求失败")
+            .json()
+            .await
+            .expect("json");
+        let m = arr.first().expect("至少一条");
+        let parsed = parse_polymarket_market_resolution_date(m);
+        assert!(
+            parsed.is_some(),
+            "预期存在 endDate 或 endDateIso，实际 keys: {:?}",
+            m.as_object()
+                .map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>())
+        );
+        let id = m["id"].as_str().expect("id");
+        let pm = PolymarketClient::new();
+        let via_id = pm.fetch_resolution_by_market_id(id).await;
+        assert!(
+            via_id.is_some(),
+            "GET /markets?id={} 应能补全到期",
+            id
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_kalshi_markets_has_resolution_field() {
+        let hc = Client::new();
+        let v: Value = hc
+            .get("https://api.elections.kalshi.com/trade-api/v2/markets")
+            .query(&[
+                ("status", "open"),
+                ("limit", "2"),
+                ("mve_filter", "exclude"),
+            ])
+            .send()
+            .await
+            .expect("Kalshi 网络请求失败")
+            .json()
+            .await
+            .expect("json");
+        let m = &v["markets"][0];
+        assert!(
+            parse_kalshi_market_resolution_date(m).is_some(),
+            "预期能自列表项解析到期；keys: {:?}",
+            m.as_object()
+                .map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>())
+        );
+        let ticker = m["ticker"].as_str().expect("ticker");
+        let ks = KalshiClient::new();
+        let via_detail = ks.fetch_resolution_by_ticker(ticker).await;
+        assert!(via_detail.is_some(), "GET /markets/{{ticker}} 应能补全到期");
     }
 }

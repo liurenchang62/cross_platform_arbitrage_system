@@ -129,6 +129,150 @@ pub fn extract_winner(title: &str) -> String {
     }
 }
 
+/// 去掉队名前的赛事前缀，如 "Miami Open: Ignacio Buse" → "Ignacio Buse"
+fn strip_team_event_prefix(team: &str) -> String {
+    let t = team.trim();
+    if let Some(i) = t.rfind(':') {
+        let after = t[i + 1..].trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Kalshi 胜负盘标题中「对阵双方」：支持 `X at Y Winner?`、`Will … win the A vs B : …`、`A vs B Winner?`
+fn extract_kalshi_moneyline_pair(title: &str) -> Option<(String, String)> {
+    let main = title.split(" - ").next()?.trim();
+    if main.is_empty() {
+        return None;
+    }
+    let lower = main.to_lowercase();
+
+    // 「Will X win map N in the TeamA vs. TeamB match?」类：必须在泛型 `vs.` 切分之前处理，
+    // 否则会把整句问句切成 (Will…JD Gaming, LYON match?)，导致两队校验失败并落入默认 1Y1N。
+    if let Some(idx) = lower.find(" in the ") {
+        let after_in = main[idx + 8..].trim();
+        let l_after = after_in.to_lowercase();
+        if let Some(end_m) = l_after.rfind(" match") {
+            let mid = after_in[..end_m].trim().trim_end_matches('?').trim();
+            if let Some(vs_dot) = mid.to_lowercase().find(" vs. ") {
+                let t1 = mid[..vs_dot].trim();
+                let t2 = mid[vs_dot + 5..].trim().trim_end_matches('?').trim();
+                if !t1.is_empty() && !t2.is_empty() {
+                    return Some((t1.to_string(), t2.to_string()));
+                }
+            }
+            if let Some(vs_s) = mid.to_lowercase().find(" vs ") {
+                let t1 = mid[..vs_s].trim();
+                let t2 = mid[vs_s + 4..].trim().trim_end_matches('?').trim();
+                if !t1.is_empty() && !t2.is_empty() {
+                    return Some((t1.to_string(), t2.to_string()));
+                }
+            }
+        }
+    }
+
+    // Texas at BYU Winner?（无 "win the"）
+    if lower.contains(" at ") {
+        let before_winner = if let Some(i) = lower.find(" winner") {
+            main[..i].trim()
+        } else {
+            main.split('?').next().unwrap_or(main).trim()
+        };
+        if let Some(pos) = before_winner.to_lowercase().find(" at ") {
+            let left = before_winner[..pos].trim();
+            let right = before_winner[pos + 4..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+
+    // "Will X win the Foo vs Bar : …" 或 "Lakers vs Celtics Winner?"
+    let segment = if let Some(wt) = lower.find("win the ") {
+        let after = &main[wt + 8..];
+        let l_after = after.to_lowercase();
+        let end = [after.find(':'), l_after.find(" round"), l_after.find(" match")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(after.len());
+        after[..end].trim()
+    } else {
+        let end = lower.find(" winner").unwrap_or(main.len());
+        main[..end].trim()
+    };
+
+    if let Some(vs_pos) = segment.to_lowercase().find(" vs ") {
+        let t1 = segment[..vs_pos].trim();
+        let rest = segment[vs_pos + 4..].trim();
+        let t2 = rest.split(':').next().unwrap_or(rest).trim();
+        if !t1.is_empty() && !t2.is_empty() {
+            return Some((t1.to_string(), t2.to_string()));
+        }
+    }
+    if let Some(vs_pos) = segment.to_lowercase().find(" vs.") {
+        let t1 = segment[..vs_pos].trim();
+        let rest = segment[vs_pos + 5..].trim();
+        let t2 = rest.split(':').next().unwrap_or(rest).trim();
+        if !t1.is_empty() && !t2.is_empty() {
+            return Some((t1.to_string(), t2.to_string()));
+        }
+    }
+
+    None
+}
+
+/// 若 Kalshi 明显是「两队胜负盘」但未能解析出双方，应拒配以免漏网
+fn kalshi_head_to_head_pair_required(title: &str) -> bool {
+    let l = title.to_lowercase();
+    (l.contains("win the ") && (l.contains(" vs") || l.contains("vs.")))
+        || (l.contains(" at ") && l.contains("winner"))
+        || ((l.contains(" vs ") || l.contains(" vs.")) && l.contains("winner"))
+}
+
+fn two_team_sets_consistent(pm_a: &str, pm_b: &str, ks_a: &str, ks_b: &str) -> bool {
+    let p1 = strip_team_event_prefix(pm_a);
+    let p2 = strip_team_event_prefix(pm_b);
+    let k1 = strip_team_event_prefix(ks_a);
+    let k2 = strip_team_event_prefix(ks_b);
+    (names_match(&p1, &k1) && names_match(&p2, &k2)) || (names_match(&p1, &k2) && names_match(&p2, &k1))
+}
+
+/// NCAA 等「打进某轮」命题 vs 单场 A at B Winner
+pub struct BracketAdvanceVsSingleGameValidator;
+
+impl BracketAdvanceVsSingleGameValidator {
+    fn is_bracket_advance_proposition(title: &str) -> bool {
+        let l = title.to_lowercase();
+        let progress = l.contains("advance to")
+            || l.contains("advance into")
+            || l.contains("reach the")
+            || l.contains("make the")
+            || l.contains("make it to");
+        let round = l.contains("sweet sixteen")
+            || l.contains("sweet 16")
+            || l.contains("final four")
+            || l.contains("elite eight")
+            || l.contains("elite 8")
+            || l.contains("national championship");
+        progress && round
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_adv = Self::is_bracket_advance_proposition(pm_title);
+        let ks_adv = Self::is_bracket_advance_proposition(kalshi_title);
+        if pm_adv && SportsSingleVsFinalsValidator::is_single_game_format(kalshi_title) {
+            return false;
+        }
+        if ks_adv && SportsSingleVsFinalsValidator::is_single_game_format(pm_title) {
+            return false;
+        }
+        true
+    }
+}
+
 fn normalize_entity_name(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut last_space = false;
@@ -160,11 +304,24 @@ fn names_match(a: &str, b: &str) -> bool {
         return true;
     }
 
-    // 允许一个是另一个的完整子串（长度限制防止误匹配）
+    // Poly/Kalshi 队名差一个空格：「TheMongolz」vs「The Mongolz」归一后应一致
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let ca = compact(&na);
+    let cb = compact(&nb);
+    if ca.len() >= 4 && cb.len() >= 4 {
+        if ca == cb {
+            return true;
+        }
+        if ca.len() >= 5 && cb.len() >= 5 && (ca.contains(&cb) || cb.contains(&ca)) {
+            return true;
+        }
+    }
+
+    // 允许一个是另一个的完整子串（>=3 以支持 BYU 等简称）
     if na.len() >= 4 && nb.contains(&na) {
         return true;
     }
-    if nb.len() >= 4 && na.contains(&nb) {
+    if nb.len() >= 3 && na.contains(&nb) {
         return true;
     }
 
@@ -284,7 +441,47 @@ impl EsportsGameValidator {
         if (pm_single && ks_total) || (pm_total && ks_single) {
             return false;
         }
+        // 网球：Total Sets O/U 与 win set N 不能匹配
+        let pm_total_sets = Self::is_total_sets_market(pm_title);
+        let ks_total_sets = Self::is_total_sets_market(kalshi_title);
+        let pm_single_set = Self::is_single_set_winner(pm_title);
+        let ks_single_set = Self::is_single_set_winner(kalshi_title);
+        if (pm_total_sets && ks_single_set) || (pm_single_set && ks_total_sets) {
+            return false;
+        }
         true
+    }
+
+    fn is_handicap_style_title(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("handicap")
+            || l.contains("让分")
+            || l.contains("spread")
+            || l.contains("map handicap")
+    }
+
+    /// Map/Game 让分盘 与 「总局 maps over/under」不能匹配
+    pub fn handicap_vs_total_maps_match(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_h = Self::is_handicap_style_title(pm_title);
+        let ks_h = Self::is_handicap_style_title(kalshi_title);
+        let pm_total = Self::is_total_maps_market(pm_title);
+        let ks_total = Self::is_total_maps_market(kalshi_title);
+        if (pm_h && ks_total) || (ks_h && pm_total) {
+            return false;
+        }
+        true
+    }
+
+    fn is_total_sets_market(title: &str) -> bool {
+        let lower = title.to_lowercase();
+        lower.contains("total sets") && (lower.contains("o/u") || lower.contains("over") || lower.contains("under"))
+            && Regex::new(r"\d+\.?\d*").map(|re| re.is_match(title)).unwrap_or(false)
+    }
+
+    fn is_single_set_winner(title: &str) -> bool {
+        Regex::new(r"(?i)win\s+set\s+\d+")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false)
     }
 
     /// 系列/BO赛果（BO5、First Stand、Group）与单局胜者不能匹配
@@ -308,6 +505,370 @@ impl EsportsGameValidator {
             return false;
         }
         true
+    }
+
+    /// 是否单局/某局胜者（含 "Will X win map N" 格式，可无 vs）
+    pub fn is_single_map_winner(title: &str) -> bool {
+        let has_win_map = Regex::new(r"(?i)win\s+(?:map|game|match)\s+\d+")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false);
+        let has_map_winner = Regex::new(r"(?i)(?:game|map|match)\s*\d+\s*winner")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false);
+        has_win_map || has_map_winner
+    }
+
+    /// 是否「整场对局谁赢」（无 Map/Game 局号），Kalshi 常见句式：Will X win the ... match
+    fn is_whole_match_winner(title: &str) -> bool {
+        let lower = title.to_lowercase();
+        if !(lower.contains(" vs ") || lower.contains(" vs.")) {
+            return false;
+        }
+        if Self::is_single_map_winner(title) || Self::is_single_game_winner(title) {
+            return false;
+        }
+        Regex::new(r"(?i)\bwin\b[^?]{0,160}\bmatch\b")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false)
+    }
+
+    /// Map/Game N 胜者 与 整场赛果胜者 不能匹配（Kalshi 一侧常无局号，不会触发 game_numbers_match）
+    pub fn map_winner_vs_whole_match_match(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_round = Self::is_single_map_winner(pm_title) || Self::is_single_game_winner(pm_title);
+        let ks_round = Self::is_single_map_winner(kalshi_title) || Self::is_single_game_winner(kalshi_title);
+        let pm_whole = Self::is_whole_match_winner(pm_title);
+        let ks_whole = Self::is_whole_match_winner(kalshi_title);
+        if (pm_round && ks_whole) || (ks_round && pm_whole) {
+            return false;
+        }
+        true
+    }
+}
+
+/// ==================== 平局 vs 胜负盘验证器 ====================
+/// 任一侧为平局/和局命题，另一侧为 A vs B Winner 类胜负盘则剔除（避免落入默认数值路径误配）
+pub struct DrawVsWinnerValidator;
+
+/// 抛硬币 / Who wins the toss 与 正常胜负盘不能混配
+pub struct TossVsMatchMarketValidator;
+
+impl TossVsMatchMarketValidator {
+    fn is_toss_proposition(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("who wins the toss")
+            || l.contains("win the toss")
+            || l.contains("wins the toss")
+            || l.contains("coin toss")
+            || l.contains("toss winner")
+            || l.contains("winner of the toss")
+            || (l.contains(" toss") && l.contains(" who "))
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_t = Self::is_toss_proposition(pm_title);
+        let ks_t = Self::is_toss_proposition(kalshi_title);
+        pm_t == ks_t
+    }
+}
+
+impl DrawVsWinnerValidator {
+    fn is_draw_or_tie_proposition(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("draw")
+            || l.contains("end in a draw")
+            || l.contains(" tie ")
+            || l.contains("finish in a tie")
+            || l.starts_with("tie ")
+    }
+
+    fn is_vs_winner_moneyline(title: &str) -> bool {
+        let l = title.to_lowercase();
+        (l.contains("winner") || title.contains("Winner"))
+            && (title.contains(" vs ") || title.contains(" vs.") || l.contains(" at "))
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        if Self::is_draw_or_tie_proposition(pm_title) && Self::is_vs_winner_moneyline(kalshi_title) {
+            return false;
+        }
+        if Self::is_draw_or_tie_proposition(kalshi_title) && Self::is_vs_winner_moneyline(pm_title) {
+            return false;
+        }
+        true
+    }
+}
+
+/// ==================== 确切比分 vs 总进球数 ====================
+/// 「Exact Score 0-1」类与「Totals Over X goals」不是同一可对冲命题
+pub struct ExactScoreVsGoalsTotalsValidator;
+
+impl ExactScoreVsGoalsTotalsValidator {
+    fn is_exact_score_market(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("exact score") || l.contains("correct score")
+    }
+
+    /// 足球等全场进球 Totals / O-U（显式含 goals）；排除电竞 maps 盘
+    fn is_goals_totals_line(title: &str) -> bool {
+        let l = title.to_lowercase();
+        if l.contains("maps") || l.contains(" map ") {
+            return false;
+        }
+        if !l.contains("goal") {
+            return false;
+        }
+        let has_ou = l.contains("over ")
+            || l.contains("under ")
+            || l.contains("o/u")
+            || l.contains("totals")
+            || l.contains("total ");
+        has_ou && Regex::new(r"\d").map(|re| re.is_match(title)).unwrap_or(false)
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_ex = Self::is_exact_score_market(pm_title);
+        let ks_ex = Self::is_exact_score_market(kalshi_title);
+        let pm_go = Self::is_goals_totals_line(pm_title);
+        let ks_go = Self::is_goals_totals_line(kalshi_title);
+        !((pm_ex && ks_go) || (ks_ex && pm_go))
+    }
+}
+
+/// ==================== 公开赛总冠军 vs 单场对阵 ====================
+/// 「Will X win the WTA Miami Open?」与「Miami Open: A vs B」不能匹配
+pub struct TournamentOutrightVsMatchValidator;
+
+impl TournamentOutrightVsMatchValidator {
+    /// Will … win the … ？且无对阵双方 vs；非「赢本场/该局」
+    fn is_tournament_outright_winner(title: &str) -> bool {
+        let main = title.split(" - ").next().unwrap_or(title).trim();
+        let l = main.to_lowercase();
+        if l.contains(" vs ") || l.contains(" vs.") {
+            return false;
+        }
+        let win_the = Regex::new(r"(?i)will\s+.+\s+win\s+the\s+")
+            .map(|re| re.is_match(main))
+            .unwrap_or(false);
+        if !win_the {
+            return false;
+        }
+        if l.contains("win the match")
+            || l.contains("win the game")
+            || l.contains("win map ")
+        {
+            return false;
+        }
+        l.contains(" open")
+            || l.contains("open?")
+            || l.contains("wta ")
+            || l.contains("atp ")
+            || l.contains("masters")
+            || l.contains("grand slam")
+            || l.contains("indian wells")
+            || l.contains("wimbledon")
+            || l.contains("roland")
+            || l.contains("french open")
+            || l.contains("australian open")
+            || l.contains("us open")
+            || l.contains("miami open")
+    }
+
+    /// 带赛事前缀的单场对阵：「Miami Open: A vs B」「WTA …: A vs B」
+    fn is_event_head_to_head_match(title: &str) -> bool {
+        if !(title.contains(" vs ") || title.contains(" vs.")) {
+            return false;
+        }
+        let l = title.to_lowercase();
+        l.contains("open:")
+            || l.contains("masters:")
+            || Regex::new(r"(?i)\b(wta|atp)\b[^:]{0,120}:")
+                .map(|re| re.is_match(title))
+                .unwrap_or(false)
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_out = Self::is_tournament_outright_winner(pm_title);
+        let ks_out = Self::is_tournament_outright_winner(kalshi_title);
+        let pm_h2h = Self::is_event_head_to_head_match(pm_title);
+        let ks_h2h = Self::is_event_head_to_head_match(kalshi_title);
+        !((pm_h2h && ks_out) || (ks_h2h && pm_out))
+    }
+}
+
+/// Team Top Batter / Top Batsman 等与「全场 A vs B 谁赢」不是同一命题
+pub struct TeamSidePropVsMatchWinnerValidator;
+
+impl TeamSidePropVsMatchWinnerValidator {
+    fn is_top_batter_or_team_scorer_prop(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("top batter")
+            || l.contains("top batsman")
+            || l.contains("top bowler")
+            || (l.contains("team top") && (l.contains("batter") || l.contains("batsman")))
+    }
+
+    /// 仅「对阵谁赢」类 Winner，已排除击球员道具
+    fn is_plain_head_to_head_winner(title: &str) -> bool {
+        let l = title.to_lowercase();
+        if !l.contains("winner") {
+            return false;
+        }
+        if Self::is_top_batter_or_team_scorer_prop(title) {
+            return false;
+        }
+        l.contains(" vs ") || l.contains(" vs.") || l.contains(" at ")
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_prop = Self::is_top_batter_or_team_scorer_prop(pm_title);
+        let ks_prop = Self::is_top_batter_or_team_scorer_prop(kalshi_title);
+        let pm_plain = Self::is_plain_head_to_head_winner(pm_title);
+        let ks_plain = Self::is_plain_head_to_head_winner(kalshi_title);
+        !((pm_prop && ks_plain) || (ks_prop && pm_plain))
+    }
+}
+
+/// ==================== 娱乐榜单验证器 ====================
+/// Billboard #1 与 Top 10 等不同档位不能匹配
+pub struct EntertainmentChartValidator;
+
+impl EntertainmentChartValidator {
+    fn looks_like_billboard_chart(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("billboard") || l.contains("hot 100") || l.contains("hot100")
+    }
+
+    fn looks_like_spotify_chart(title: &str) -> bool {
+        title.to_lowercase().contains("spotify")
+    }
+
+    fn has_number_one_rank(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("#1")
+            || l.contains("# 1")
+            || l.contains("number one")
+            || l.contains("no. 1")
+            || l.contains("no 1 ")
+    }
+
+    fn has_top_ten_rank(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("top 10") || l.contains("top10")
+    }
+
+    /// Billboard/Hot100 与 Spotify 混配（用于二筛提示语）
+    pub(crate) fn is_billboard_spotify_cross(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_bb = Self::looks_like_billboard_chart(pm_title);
+        let ks_bb = Self::looks_like_billboard_chart(kalshi_title);
+        let pm_spotify = Self::looks_like_spotify_chart(pm_title);
+        let ks_spotify = Self::looks_like_spotify_chart(kalshi_title);
+        (pm_spotify && ks_bb) || (pm_bb && ks_spotify)
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_bb = Self::looks_like_billboard_chart(pm_title);
+        let ks_bb = Self::looks_like_billboard_chart(kalshi_title);
+        let pm_spotify = Self::looks_like_spotify_chart(pm_title);
+        let ks_spotify = Self::looks_like_spotify_chart(kalshi_title);
+        // 榜单数据源须一致：Spotify #1 与 Billboard Hot 100 等不能互配
+        if (pm_spotify && ks_bb) || (pm_bb && ks_spotify) {
+            return false;
+        }
+
+        if !pm_bb || !ks_bb {
+            return true;
+        }
+        let pm_one = Self::has_number_one_rank(pm_title);
+        let ks_one = Self::has_number_one_rank(kalshi_title);
+        let pm_t10 = Self::has_top_ten_rank(pm_title);
+        let ks_t10 = Self::has_top_ten_rank(kalshi_title);
+        if (pm_one && ks_t10) || (ks_one && pm_t10) {
+            return false;
+        }
+        true
+    }
+}
+
+/// ==================== 让分 vs 单局胜者验证器 ====================
+/// 让分盘口（Handicap）与单纯的某局胜者（win map N）不能匹配
+pub struct HandicapVsSingleWinnerValidator;
+
+impl HandicapVsSingleWinnerValidator {
+    pub fn is_handicap_market(title: &str) -> bool {
+        let lower = title.to_lowercase();
+        lower.contains("handicap") || lower.contains("让分") || lower.contains("spread")
+    }
+
+    /// 让分盘对面的「整场 moneyline」：`A at B Winner?` 或 `Will X win … vs … match?`（可无 Winner 字眼）
+    fn is_moneyline_winner_proposition(title: &str) -> bool {
+        let l = title.to_lowercase();
+        if l.contains(" at ") && (l.contains("winner") || title.contains("Winner")) {
+            return true;
+        }
+        Regex::new(r"(?i)\bwin\b[^?]{0,160}\bmatch\b")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false)
+    }
+
+    pub fn handicap_vs_single_winner_match(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_handicap = Self::is_handicap_market(pm_title);
+        let ks_handicap = Self::is_handicap_market(kalshi_title);
+        let pm_single = EsportsGameValidator::is_single_map_winner(pm_title);
+        let ks_single = EsportsGameValidator::is_single_map_winner(kalshi_title);
+        if (pm_handicap && ks_single) || (ks_handicap && pm_single) {
+            return false;
+        }
+        // 让分 vs 单场胜负盘（非仅 Map 局胜）
+        let pm_ml = Self::is_moneyline_winner_proposition(pm_title);
+        let ks_ml = Self::is_moneyline_winner_proposition(kalshi_title);
+        if (pm_handicap && ks_ml) || (ks_handicap && pm_ml) {
+            return false;
+        }
+        true
+    }
+}
+
+/// ==================== 决赛一致性验证器 ====================
+/// 一方有 Finals 另一方没有时，必须双方都包含相同两队才允许匹配，否则剔除
+pub struct FinalsConsistencyValidator;
+
+impl FinalsConsistencyValidator {
+    fn has_finals_keyword(title: &str) -> bool {
+        let lower = title.to_lowercase();
+        lower.contains("finals") || lower.contains("championship") || lower.contains("conference finals")
+    }
+
+    pub(crate) fn trim_team_suffix(s: &str) -> String {
+        let s = if let Some(i) = s.find(" Winner") { s[..i].trim_end() } else { s };
+        let s = if let Some(i) = s.find(" - ") { s[..i].trim_end() } else { s };
+        s.trim().to_string()
+    }
+
+    /// 从 "A vs B" 格式提取两队，去掉 " Winner? - X"、"- NBA Finals" 等后缀
+    fn extract_teams_cleaned(title: &str) -> Option<(String, String)> {
+        let (t1, t2) = extract_teams(title)?;
+        Some((Self::trim_team_suffix(&t1), Self::trim_team_suffix(&t2)))
+    }
+
+    pub fn finals_consistency_match(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_finals = Self::has_finals_keyword(pm_title);
+        let ks_finals = Self::has_finals_keyword(kalshi_title);
+        if pm_finals == ks_finals {
+            return true;
+        }
+        // 一方有 Finals 一方没有：必须双方都有 " vs " 且两队一致
+        let pm_teams = match Self::extract_teams_cleaned(pm_title) {
+            Some(t) => t,
+            None => return false,
+        };
+        let ks_teams = match Self::extract_teams_cleaned(kalshi_title) {
+            Some(t) => t,
+            None => return false,
+        };
+        let (pm_a, pm_b) = pm_teams;
+        let (ks_a, ks_b) = ks_teams;
+        (names_match(&pm_a, &ks_a) && names_match(&pm_b, &ks_b))
+            || (names_match(&pm_a, &ks_b) && names_match(&pm_b, &ks_a))
     }
 }
 
@@ -351,15 +912,12 @@ impl GarbageMarketDetector {
     pub fn is_garbage_sports_market(title: &str) -> bool {
         let lower = title.to_lowercase();
         
-        // 硬规则: O/U X.X Rounds 这种直接扔
+        // 硬规则: 无对阵双方的「O/U … Rounds」裸盘一律垃圾（不靠大写数量放行）
         if lower.contains("o/u") && lower.contains("rounds") {
-            let upper_count = title.chars().filter(|c| c.is_uppercase()).count();
-            let has_specific = lower.contains(" vs ") || 
-                               lower.contains(" at ") ||
-                               lower.contains(" - ") ||
-                               upper_count > 2;
-            
-            if !has_specific {
+            let has_matchup = lower.contains(" vs ")
+                || lower.contains(" vs.")
+                || lower.contains(" at ");
+            if !has_matchup {
                 return true;
             }
         }
@@ -394,6 +952,15 @@ pub struct WinnerMarketValidator;
 
 impl WinnerMarketValidator {
     pub fn validate(pm_title: &str, kalshi_title: &str) -> Option<(String, String, bool)> {
+        // 总进球数 O/U 与胜负 Winner 不能匹配
+        if pm_title.to_lowercase().contains("o/u") {
+            return None;
+        }
+        // 平手 Draw/Tie 与胜负 Winner 不能匹配
+        let pm_lower = pm_title.to_lowercase();
+        if pm_lower.contains("draw") || pm_lower.contains("end in a draw") || pm_lower.contains(" tie ") {
+            return None;
+        }
         // 检查是否都是胜负市场
         let pm_is_winner = pm_title.contains(" vs ") || pm_title.contains(" vs. ");
         let ks_is_winner = kalshi_title.contains("Winner") || kalshi_title.contains(" - ");
@@ -408,14 +975,30 @@ impl WinnerMarketValidator {
         if ks_winner.is_empty() {
             return None;
         }
+
+        // Kalshi 若含明确两队对阵，必须与 PM 的双方一致（防「同选手、不同场次」）
+        match extract_kalshi_moneyline_pair(kalshi_title) {
+            Some((k1, k2)) => {
+                if !two_team_sets_consistent(&pm_team1, &pm_team2, &k1, &k2) {
+                    return None;
+                }
+            }
+            None => {
+                if kalshi_head_to_head_pair_required(kalshi_title) {
+                    return None;
+                }
+            }
+        }
         
-        // 判断是否匹配
-        if names_match(&pm_team1, &ks_winner) {
-            // 直接匹配：PM 买 Yes（前者胜） = Kalshi 买 Yes（前者胜）
-            Some(("YES".to_string(), "YES".to_string(), false))
-        } else if names_match(&pm_team2, &ks_winner) {
-            // 颠倒匹配：PM 买 Yes（前者胜） = Kalshi 买 No（后者胜）
-            Some(("YES".to_string(), "NO".to_string(), true))
+        // 套利必须覆盖两队。颠倒=2Y/2N，非颠倒=1Y1N（队名须去前缀/去 Map 后缀再比）
+        let pt1 = strip_team_event_prefix(&pm_team1);
+        let pt2 = strip_team_event_prefix(&FinalsConsistencyValidator::trim_team_suffix(&pm_team2));
+        if names_match(&pt1, &ks_winner) {
+            // Kalshi 问队1胜：PM Yes(队1) + Kalshi No(队2)，1Y1N 无颠倒
+            Some(("YES".to_string(), "NO".to_string(), false))
+        } else if names_match(&pt2, &ks_winner) {
+            // Kalshi 问队2胜：PM Yes(队2) + Kalshi Yes(队2)，2Y 为颠倒
+            Some(("YES".to_string(), "YES".to_string(), true))
         } else {
             None
         }
@@ -423,7 +1006,9 @@ impl WinnerMarketValidator {
 }
 
 /// ==================== 技术统计市场验证器 ====================
-/// 体育球员技术统计（得分/助攻/篮板/三分）必须类型一致，且 O/U 5.5 Over 仅与 6+ 等价
+/// 体育球员技术统计（得分/助攻/篮板/三分）必须类型一致
+/// O/U 5.5 Over 等价于 6+：同向，1Y1N，无颠倒
+/// O/U 6.5 Over 与 6- 为颠倒市场：PM Y=>=7，Kalshi Y=<=6，需 (YES,YES)
 pub struct StatMarketValidator;
 
 /// 统计类型归一化（points/rebounds/assists/threes 互斥）
@@ -482,35 +1067,46 @@ impl StatMarketValidator {
         Self::extract_pm_stat(pm_title).is_some() && Self::extract_ks_stat(kalshi_title).is_some()
     }
 
-    /// 验证：统计类型一致且阈值严格匹配（O/U 5.5 Over ↔ 6+，与 5+ 不等价）
+    /// 验证：统计类型一致且阈值匹配
+    /// 同向（Over+Plus 或 Under+Minus）：等价市场，1Y1N 无颠倒
+    /// 颠倒（Over+Minus 或 Under+Plus）：相反市场，需 (YES,YES)
     pub fn validate(pm_title: &str, kalshi_title: &str) -> Option<(String, String, bool)> {
         let (pm_stat, pm_num, pm_is_over) = Self::extract_pm_stat(pm_title)?;
         let (ks_stat, ks_num, ks_is_plus) = Self::extract_ks_stat(kalshi_title)?;
 
-        // 统计类型必须一致
         if pm_stat != ks_stat {
             return None;
         }
 
-        // 阈值严格匹配：O/U 5.5 Over 对应 6+，不对应 5+
         let pm_threshold = if pm_is_over { pm_num.ceil() as i32 } else { pm_num.floor() as i32 };
+        let ks_ceil = ks_num.ceil() as i32;
+        let ks_floor = ks_num.floor() as i32;
 
         if ks_is_plus {
-            if !pm_is_over {
-                return None;
-            }
-            let ks_threshold = ks_num.ceil() as i32;
-            if pm_threshold == ks_threshold {
-                return Some(("YES".to_string(), "YES".to_string(), false));
+            // Kalshi N+ = Over
+            if pm_is_over {
+                // 同向：O/U 5.5 Over ↔ 6+，等价，1Y1N 无颠倒
+                if pm_threshold == ks_ceil {
+                    return Some(("YES".to_string(), "NO".to_string(), false));
+                }
+            } else {
+                // 颠倒：PM Under(<=5) + Kalshi 6+(>=6)，Y/Y 覆盖
+                if pm_threshold + 1 == ks_ceil {
+                    return Some(("YES".to_string(), "YES".to_string(), true));
+                }
             }
         } else {
-            // ks_is_minus (Kalshi N- 表示 Under)
-            if pm_is_over {
-                return None;
-            }
-            let ks_floor = ks_num.floor() as i32;
-            if pm_threshold == ks_floor {
-                return Some(("YES".to_string(), "NO".to_string(), true));
+            // Kalshi N- = Under
+            if !pm_is_over {
+                // 同向：O/U 6.5 Under ↔ 6-，等价，1Y1N 无颠倒
+                if pm_threshold == ks_floor {
+                    return Some(("YES".to_string(), "NO".to_string(), false));
+                }
+            } else {
+                // 颠倒：PM Over(>=7) + Kalshi 6-(<=6)，Y/Y 覆盖
+                if pm_threshold == ks_floor + 1 {
+                    return Some(("YES".to_string(), "YES".to_string(), true));
+                }
             }
         }
         None
@@ -546,44 +1142,45 @@ impl ScoreMarketValidator {
             None => return None,
         };
         
-        // 判断方向
+        // 判断方向：同向等价无颠倒，颠倒需 (YES,YES)
         let pm_is_over = !pm_title.to_lowercase().contains("under");
         
         let ks_is_plus = Regex::new(r"\b\d+(\.\d+)?\s*\+").ok()?.is_match(kalshi_title);
         let ks_is_minus = Regex::new(r"\b\d+(\.\d+)?\s*-").ok()?.is_match(kalshi_title);
         
+        let pm_threshold = if pm_is_over { pm_num.ceil() as i32 } else { pm_num.floor() as i32 };
+        let ks_ceil = ks_num.ceil() as i32;
+        let ks_floor = ks_num.floor() as i32;
+
         if ks_is_plus {
-            // Kalshi + 表示 Over：
-            // PM 允许向上取整，但必须严格等价（不再允许 ±1 档位）
-            if !pm_is_over {
-                return None; // 方向不一致
-            }
-            let pm_threshold = pm_num.ceil() as i32;
-            let ks_threshold = ks_num.ceil() as i32;
-            
-            if pm_threshold == ks_threshold {
-                return Some(("YES".to_string(), "YES".to_string(), false));
+            if pm_is_over {
+                // 同向：Over + N+，等价，1Y1N 无颠倒
+                if pm_threshold == ks_ceil {
+                    return Some(("YES".to_string(), "NO".to_string(), false));
+                }
+            } else {
+                // 颠倒：Under + N+，Y/Y 覆盖
+                if pm_threshold + 1 == ks_ceil {
+                    return Some(("YES".to_string(), "YES".to_string(), true));
+                }
             }
         } else if ks_is_minus {
-            // Kalshi - 表示 Under：
-            // PM 允许向下取整，严格等价；并且套利方向需要 Y/N 颠倒
-            if pm_is_over {
-                return None; // 方向不一致
-            }
-            let pm_threshold = pm_num.floor() as i32;
-            let ks_threshold = ks_num.floor() as i32;
-            
-            if pm_threshold == ks_threshold {
-                // 方向相反，需要颠倒 Y/N
-                return Some(("YES".to_string(), "NO".to_string(), true));
+            if !pm_is_over {
+                // 同向：Under + N-，等价，1Y1N 无颠倒
+                if pm_threshold == ks_floor {
+                    return Some(("YES".to_string(), "NO".to_string(), false));
+                }
+            } else {
+                // 颠倒：Over + N-，Y/Y 覆盖
+                if pm_threshold == ks_floor + 1 {
+                    return Some(("YES".to_string(), "YES".to_string(), true));
+                }
             }
         } else {
-            // 默认按 Over 处理
-            let pm_threshold = if pm_is_over { pm_num.ceil() as i32 } else { pm_num.floor() as i32 };
-            let ks_threshold = if pm_is_over { ks_num.ceil() as i32 } else { ks_num.floor() as i32 };
-            
+            // 默认按同向处理
+            let ks_threshold = if pm_is_over { ks_ceil } else { ks_floor };
             if pm_threshold == ks_threshold {
-                return Some(("YES".to_string(), "YES".to_string(), false));
+                return Some(("YES".to_string(), "NO".to_string(), false));
             }
         }
         
@@ -600,8 +1197,6 @@ impl DateValidator {
     }
     
     pub fn extract_date(text: &str) -> Option<DateInfo> {
-        let text_lower = text.to_lowercase();
-        
         let re = Regex::new(r"(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:,?\s*(\d{4}))?").ok()?;
         
         if let Some(caps) = re.captures(text) {
@@ -765,6 +1360,16 @@ impl ValidationPipeline {
             return None;
         }
 
+        // 1.1b 娱乐榜单：Billboard #1 与 Top 10 不能匹配
+        if EntertainmentChartValidator::is_billboard_spotify_cross(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "娱乐榜单来源不一致(Billboard与Spotify)");
+            return None;
+        }
+        if !EntertainmentChartValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "娱乐榜单#1与Top10不能匹配");
+            return None;
+        }
+
         // 1.2 电竞对局：局数必须一致；单局胜者与总局数市场不能匹配
         if !EsportsGameValidator::game_numbers_match(pm_title, kalshi_title) {
             self.record_filter(pm_title, kalshi_title, "电竞局数不匹配");
@@ -774,14 +1379,70 @@ impl ValidationPipeline {
             self.record_filter(pm_title, kalshi_title, "电竞单局与总局数不能匹配");
             return None;
         }
+        if !EsportsGameValidator::handicap_vs_total_maps_match(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "让分盘与总局maps盘不能匹配");
+            return None;
+        }
         if !EsportsGameValidator::single_vs_series_match(pm_title, kalshi_title) {
             self.record_filter(pm_title, kalshi_title, "电竞单局与BO5/系列赛不能匹配");
+            return None;
+        }
+        if !EsportsGameValidator::map_winner_vs_whole_match_match(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "电竞Map局胜者与整场赛果不能匹配");
             return None;
         }
 
         // 1.3 体育：单场比赛与决赛不能匹配
         if !SportsSingleVsFinalsValidator::single_vs_finals_match(pm_title, kalshi_title) {
             self.record_filter(pm_title, kalshi_title, "体育单场与决赛不能匹配");
+            return None;
+        }
+
+        // 1.4 让分盘口与某局胜者不能匹配
+        if !HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "让分盘口与某局胜者不能匹配");
+            return None;
+        }
+
+        // 1.4b 确切比分 vs 总进球数 Totals
+        if !ExactScoreVsGoalsTotalsValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "确切比分与总进球数不能匹配");
+            return None;
+        }
+
+        // 1.4c 公开赛/巡回赛总冠军 vs 带赛事前缀的单场对阵
+        if !TournamentOutrightVsMatchValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "公开赛总冠军与单场对阵不能匹配");
+            return None;
+        }
+
+        // 1.4d Team Top Batter 等与全场胜负盘
+        if !TeamSidePropVsMatchWinnerValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "队内最佳击球员等与全场胜负盘不能匹配");
+            return None;
+        }
+
+        // 1.5 决赛一致性：一方有 Finals 另一方没有时，必须双方都含相同两队，否则剔除
+        if !FinalsConsistencyValidator::finals_consistency_match(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "决赛不一致（一方有Finals另一方无且非同一两队）");
+            return None;
+        }
+
+        // 1.6 平局与胜负盘不能匹配（避免落入默认数值比较误配）
+        if !DrawVsWinnerValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "平局市场与胜负盘不能匹配");
+            return None;
+        }
+
+        // 1.7 锦标赛「打进某轮」vs 单场 A at B Winner 不能匹配
+        if !BracketAdvanceVsSingleGameValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "锦标赛晋级命题与单场胜负不能匹配");
+            return None;
+        }
+
+        // 1.8 抛硬币/掷币 vs 非掷币赛果不能混配
+        if !TossVsMatchMarketValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "抛硬币/掷币与赛果命题不一致");
             return None;
         }
         
@@ -835,22 +1496,37 @@ impl ValidationPipeline {
             }
         }
 
-        // 4. 默认数值比较
+        // 4. 默认数值比较（禁止：双方均为电竞 Map/局胜者却未通过胜负校验时走 1Y1N）
+        let pm_map_winner_line = EsportsGameValidator::is_single_map_winner(pm_title)
+            || EsportsGameValidator::is_single_game_winner(pm_title);
+        let ks_map_winner_line = EsportsGameValidator::is_single_map_winner(kalshi_title);
+        if pm_map_winner_line && ks_map_winner_line {
+            self.record_filter(pm_title, kalshi_title, "电竞Map局胜者须通过胜负与两队校验");
+            return None;
+        }
+
         let pm_numbers = NumberComparator::extract_numbers(pm_title);
         let kalshi_numbers = NumberComparator::extract_numbers(kalshi_title);
+
+        // 双侧都无数字锚点时不再放行默认 YES/NO（易误配晋级命题等）
+        if pm_numbers.is_empty() && kalshi_numbers.is_empty() {
+            self.record_filter(pm_title, kalshi_title, "默认路径需至少一侧有锚点数字");
+            return None;
+        }
         
         if !NumberComparator::compare_numbers(&pm_numbers, &kalshi_numbers) {
             self.record_filter(pm_title, kalshi_title, "数值不匹配");
             return None;
         }
         
+        // 默认：无法确定时采用 1Y1N（同问法则买相反边），非颠倒市场不应出现双 YES
         let match_info = MatchInfo {
             pm_title: pm_title.to_string(),
             kalshi_title: kalshi_title.to_string(),
             similarity,
             category: category.to_string(),
             pm_side: "YES".to_string(),
-            kalshi_side: "YES".to_string(),
+            kalshi_side: "NO".to_string(),
             needs_inversion: false,
         };
         self.record_retained(&match_info);
@@ -925,21 +1601,93 @@ mod tests {
     
     #[test]
     fn test_winner_market() {
+        // 队1：1Y1N 无颠倒
         let result = WinnerMarketValidator::validate(
             "Lakers vs Celtics",
             "Lakers vs Celtics Winner? - Lakers"
         ).unwrap();
         assert_eq!(result.0, "YES");
-        assert_eq!(result.1, "YES");
+        assert_eq!(result.1, "NO");
         assert!(!result.2);
-        
+
+        // 队2：2Y 为颠倒
         let result = WinnerMarketValidator::validate(
             "Lakers vs Celtics",
             "Lakers vs Celtics Winner? - Celtics"
         ).unwrap();
         assert_eq!(result.0, "YES");
-        assert_eq!(result.1, "NO");
+        assert_eq!(result.1, "YES");
         assert!(result.2);
+
+        // 总进球数 O/U 与胜负 Winner 不能匹配
+        assert!(WinnerMarketValidator::validate(
+            "Mainz vs Olomouc: O/U 1.5",
+            "Mainz vs Olomouc Winner? - Olomouc"
+        ).is_none());
+
+        // 平手 Draw 与胜负 Winner 不能匹配
+        assert!(WinnerMarketValidator::validate(
+            "Will Arsenal FC vs. Manchester City FC end in a draw?",
+            "Arsenal vs Manchester City Winner? - Manchester City"
+        ).is_none());
+
+        // Texas at BYU：Kalshi 问 BYU(队2)，应 (YES,YES) 颠倒
+        let result = WinnerMarketValidator::validate(
+            "Texas Longhorns vs. BYU Cougars",
+            "Texas at BYU Winner? - BYU"
+        ).unwrap();
+        assert_eq!(result.0, "YES");
+        assert_eq!(result.1, "YES");
+        assert!(result.2);
+    }
+
+    #[test]
+    fn test_winner_tennis_wrong_opponent_rejected() {
+        assert!(WinnerMarketValidator::validate(
+            "Miami Open: Ignacio Buse vs Damir Dzumhur",
+            "Will Damir Dzumhur win the Dzumhur vs Sinner : Round Of 64 match? - Damir Dzumhur"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_bracket_advance_vs_single_game() {
+        assert!(!BracketAdvanceVsSingleGameValidator::allows_pair(
+            "Will Texas advance to the Sweet Sixteen?",
+            "Texas at BYU Winner? - Texas"
+        ));
+        assert!(!BracketAdvanceVsSingleGameValidator::allows_pair(
+            "Will Duke advance to the Final Four?",
+            "TCU at Duke Winner? - Duke"
+        ));
+    }
+
+    #[test]
+    fn test_handicap_vs_whole_match_winner() {
+        assert!(!HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(
+            "Game Handicap: JDG (-2.5) vs LYON (+2.5)",
+            "Will LYON win the JD Gaming vs. LYON League of Legends match? - LYON"
+        ));
+    }
+
+    #[test]
+    fn test_toss_vs_match_winner_rejected() {
+        assert!(!TossVsMatchMarketValidator::allows_pair(
+            "T20I Series NZ vs SA: New Zealand vs South Africa - Who wins the toss?",
+            "New Zealand vs South Africa Winner? - South Africa"
+        ));
+        assert!(TossVsMatchMarketValidator::allows_pair(
+            "Team A vs Team B - Who wins the toss?",
+            "Team A vs Team B - Who wins the toss?"
+        ));
+    }
+
+    #[test]
+    fn test_handicap_vs_total_maps_rejected() {
+        assert!(!EsportsGameValidator::handicap_vs_total_maps_match(
+            "Map Handicap: FURIA (-1.5) vs Aurora Gaming (+1.5)",
+            "Will over 2.5 maps be played in the FURIA vs. Aurora Gaming CS2 match? - Over 2.5 maps"
+        ));
     }
     
     #[test]
@@ -980,6 +1728,42 @@ mod tests {
     }
 
     #[test]
+    fn test_handicap_vs_single_winner() {
+        // 让分盘口 vs 某局胜者 -> 不能匹配
+        assert!(!HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(
+            "Game Handicap: BFX (-1.5) vs G2 Esports (+1.5)",
+            "Will G2 Esports win map 2 in the BNK FEARX vs. G2 Esports match? - G2 Esports"
+        ));
+        assert!(!HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(
+            "Will BNK win map 3 in the BNK vs. G2 match? - BNK",
+            "Game Handicap: BFX (-2.5) vs G2 Esports (+2.5)"
+        ));
+    }
+
+    #[test]
+    fn test_finals_consistency() {
+        // PM 有 Finals 无 vs，Kalshi 无 Finals -> 剔除
+        assert!(!FinalsConsistencyValidator::finals_consistency_match(
+            "Will the New York Knicks win the NBA Eastern Conference Finals?",
+            "Houston vs New York M Winner? - New York M"
+        ));
+        assert!(!FinalsConsistencyValidator::finals_consistency_match(
+            "Will the New York Knicks win the NBA Eastern Conference Finals?",
+            "New York Y vs Detroit Winner? - New York Y"
+        ));
+        // 双方都有 vs 且同两队、一方有 Finals -> 允许
+        assert!(FinalsConsistencyValidator::finals_consistency_match(
+            "Lakers vs Celtics - NBA Finals",
+            "Lakers vs Celtics Winner? - Lakers"
+        ));
+        // 双方都无 Finals -> 允许
+        assert!(FinalsConsistencyValidator::finals_consistency_match(
+            "Lakers vs Celtics",
+            "Lakers vs Celtics Winner? - Lakers"
+        ));
+    }
+
+    #[test]
     fn test_esports_single_vs_total() {
         // 单局胜者 vs 总局数 -> 不能匹配
         assert!(!EsportsGameValidator::single_vs_total_match(
@@ -990,6 +1774,11 @@ mod tests {
         assert!(EsportsGameValidator::single_vs_total_match(
             "LoL: G2 vs BNK - Game 3 Winner",
             "Will BNK win map 3 in the BNK vs. G2 match? - BNK"
+        ));
+        // 网球 Total Sets O/U vs win set N -> 不能匹配
+        assert!(!EsportsGameValidator::single_vs_total_match(
+            "Emilio Nava vs. Tomas Machac: Total Sets O/U 2.5",
+            "Will Tomas Machac win set 2 in the Emilio Nava vs Tomas Machac match - Tomas Machac"
         ));
     }
 
@@ -1011,16 +1800,153 @@ mod tests {
             "Lakers vs Celtics Winner? - Lakers"
         ));
     }
+
+    #[test]
+    fn test_map_winner_vs_whole_match() {
+        assert!(!EsportsGameValidator::map_winner_vs_whole_match_match(
+            "Counter-Strike: ENCE Academy vs BIG Academy - Map 2 Winner",
+            "Will ENCE Academy win the ENCE Academy vs. BIG Academy CS2 match? - ENCE Academy"
+        ));
+        // 两侧均为单局或均为整场 -> 不由本规则单独拦截
+        assert!(EsportsGameValidator::map_winner_vs_whole_match_match(
+            "Lakers vs Celtics",
+            "Lakers vs Celtics Winner? - Lakers"
+        ));
+    }
+
+    #[test]
+    fn test_draw_vs_winner() {
+        assert!(!DrawVsWinnerValidator::allows_pair(
+            "Will Arsenal FC vs. Manchester City FC end in a draw?",
+            "Arsenal vs Manchester City Winner? - Arsenal"
+        ));
+        assert!(DrawVsWinnerValidator::allows_pair(
+            "Lakers vs Celtics",
+            "Lakers vs Celtics Winner? - Lakers"
+        ));
+    }
+
+    #[test]
+    fn test_exact_score_vs_goals_totals_rejected() {
+        assert!(!ExactScoreVsGoalsTotalsValidator::allows_pair(
+            "Exact Score: 1. FSV Mainz 05 0 - 1 Eintracht Frankfurt?",
+            "Frankfurt at Mainz: Totals - Over 4.5 goals scored"
+        ));
+        assert!(!ExactScoreVsGoalsTotalsValidator::allows_pair(
+            "Exact Score: 1. FSV Mainz 05 0 - 0 Eintracht Frankfurt?",
+            "Frankfurt at Mainz: Totals - Over 1.5 goals scored"
+        ));
+        // 两侧均为总进球盘 -> 仍由其它规则处理，本规则放行
+        assert!(ExactScoreVsGoalsTotalsValidator::allows_pair(
+            "Frankfurt at Mainz: Totals - Over 2.5 goals scored",
+            "Mainz vs Frankfurt: Over 2.5 goals?"
+        ));
+    }
+
+    #[test]
+    fn test_open_outright_vs_round_match_rejected() {
+        assert!(!TournamentOutrightVsMatchValidator::allows_pair(
+            "Miami Open: Elisabetta Cocciaretto vs Coco Gauff",
+            "Will Coco Gauff win the WTA Miami Open? - Coco Gauff"
+        ));
+        // 无「赛事: vs」前缀的 Kalshi 单场胜负，不应被本规则拦截
+        assert!(TournamentOutrightVsMatchValidator::allows_pair(
+            "Miami Open: A vs B",
+            "A vs B Winner? - A"
+        ));
+        // 非公开赛总冠军命题
+        assert!(TournamentOutrightVsMatchValidator::allows_pair(
+            "Lakers vs Celtics",
+            "Lakers vs Celtics Winner? - Lakers"
+        ));
+    }
+
+    #[test]
+    fn test_cs_vitality_map_kalshi_inversion() {
+        let r = WinnerMarketValidator::validate(
+            "Counter-Strike: TheMongolz vs Vitality - Map 2 Winner",
+            "Will Vitality win map 2 in the Vitality vs. The Mongolz match? - Vitality",
+        )
+        .expect("TheMongolz vs The Mongolz 应两队一致且判颠倒");
+        assert_eq!(r.0, "YES");
+        assert_eq!(r.1, "YES");
+        assert!(r.2);
+    }
+
+    #[test]
+    fn test_top_batter_vs_plain_match_winner_rejected() {
+        assert!(!TeamSidePropVsMatchWinnerValidator::allows_pair(
+            "T20 Series New Zealand vs South Africa: New Zealand vs South Africa - Team Top Batter South Africa Winner",
+            "New Zealand vs South Africa Winner? - South Africa"
+        ));
+    }
+
+    #[test]
+    fn test_ou_rounds_bare_is_garbage() {
+        assert!(GarbageMarketDetector::is_garbage_sports_market("O/U 1.5 Rounds"));
+        assert!(!GarbageMarketDetector::is_garbage_sports_market(
+            "Team A vs Team B: O/U 1.5 Rounds in match"
+        ));
+    }
+
+    #[test]
+    fn test_mismatched_map_winners_no_default_path() {
+        let mut p = ValidationPipeline::new();
+        assert!(p
+            .validate(
+                "Counter-Strike: MINLATE vs MANA eSports - Map 1 Winner",
+                "Will MANA eSports win map 1 in the Rebels Gaming vs. MANA eSports match? - MANA eSports",
+                0.9,
+                "esports",
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn test_entertainment_chart_number_one_vs_top10() {
+        assert!(!EntertainmentChartValidator::allows_pair(
+            "Will \"Choosin' Texas\" by Ella Langley be the Billboard #1 song for the week of March 28?",
+            "Will Choosin' Texas be Top 10 on the Billboard Hot 100 chart for the week of March 28th in 2026? - Choosin' Texas"
+        ));
+        assert!(EntertainmentChartValidator::allows_pair(
+            "Will X be Billboard #1 for March 28?",
+            "Will Y be Billboard #1 for March 28?"
+        ));
+    }
+
+    #[test]
+    fn test_entertainment_spotify_vs_billboard_rejected() {
+        assert!(!EntertainmentChartValidator::allows_pair(
+            "Will \"Choosin' Texas - Ella Langley\" be the #1 song on US Spotify this week?",
+            "Will Choosin' Texas be the #1 song on the Billboard Hot 100 charts this week? - Choosin' Texas"
+        ));
+        assert!(EntertainmentChartValidator::is_billboard_spotify_cross(
+            "Will X be #1 on US Spotify?",
+            "Will Y be #1 on Billboard Hot 100? - Y"
+        ));
+    }
+
+    #[test]
+    fn test_lyon_jd_esports_map_kalshi_pair_yields_inversion() {
+        let r = WinnerMarketValidator::validate(
+            "LoL: LYON vs JD Gaming - Game 1 Winner",
+            "Will JD Gaming win map 1 in the JD Gaming vs. LYON match? - JD Gaming",
+        )
+        .expect("Kalshi in the A vs. B match 应解析出两队并判为颠倒");
+        assert_eq!(r.0, "YES");
+        assert_eq!(r.1, "YES");
+        assert!(r.2, "Kalshi 问 PM 队2胜 应为 2Y 颠倒");
+    }
     
     #[test]
     fn test_score_market() {
-        // Points 等技术统计现由 StatMarketValidator 统一处理
+        // 同向：O/U 19.5 Over 与 20+ 等价，1Y1N 无颠倒
         let result = StatMarketValidator::validate(
             "Points O/U 19.5",
             "20+ points"
         ).unwrap();
         assert_eq!(result.0, "YES");
-        assert_eq!(result.1, "YES");
+        assert_eq!(result.1, "NO");
         assert!(!result.2);
 
         let result = StatMarketValidator::validate(
@@ -1029,12 +1955,31 @@ mod tests {
         );
         assert!(result.is_none());
 
+        // 同向：Under 20.5 与 20- 等价，1Y1N 无颠倒
         let result = StatMarketValidator::validate(
             "Points Under 20.5",
             "20- points"
         ).unwrap();
         assert_eq!(result.0, "YES");
         assert_eq!(result.1, "NO");
+        assert!(!result.2);
+
+        // 颠倒：O/U 6.5 Over(>=7) + 6-(<=6)，需 (YES,YES)
+        let result = StatMarketValidator::validate(
+            "Points O/U 6.5",
+            "6- points"
+        ).unwrap();
+        assert_eq!(result.0, "YES");
+        assert_eq!(result.1, "YES");
+        assert!(result.2);
+
+        // 颠倒：O/U 5.5 Under(<=5) + 6+(>=6)，需 (YES,YES)
+        let result = StatMarketValidator::validate(
+            "Points Under 5.5",
+            "6+ points"
+        ).unwrap();
+        assert_eq!(result.0, "YES");
+        assert_eq!(result.1, "YES");
         assert!(result.2);
     }
 

@@ -281,34 +281,34 @@ impl MarketMatcher {
         
         let start_time = std::time::Instant::now();
         
-        println!("\n📌 并行执行两个方向...");
+        println!("\n📌 并行执行两个方向（spawn_blocking 确保 CPU 密集任务真并行）...");
         
-        // 真正的并行执行
-        let handle1 = task::spawn(async move {
+        // 使用 spawn_blocking 保证 CPU 密集的匹配循环真并行，不阻塞 async worker
+        let handle1 = task::spawn_blocking(move || {
             let mut pipeline = ValidationPipeline::new();
-            let matches = Self::find_matches_directional_internal(
+            let matches = Self::find_matches_directional_sync(
                 &pm_markets_vec,
                 &kalshi_vec,
                 &category_mapper1,
                 &config1,
                 &market_cache1,
                 &mut pipeline,
-                "PM→Kalshi",  // 方向标识
-            ).await;
+                "PM→Kalshi",
+            );
             (matches, pipeline)
         });
         
-        let handle2 = task::spawn(async move {
+        let handle2 = task::spawn_blocking(move || {
             let mut pipeline = ValidationPipeline::new();
-            let matches = Self::find_matches_directional_internal(
+            let matches = Self::find_matches_directional_sync(
                 &kalshi_markets_vec,
                 &polymarket_vec,
                 &category_mapper2,
                 &config2,
                 &market_cache2,
                 &mut pipeline,
-                "Kalshi→PM",  // 方向标识
-            ).await;
+                "Kalshi→PM",
+            );
             (matches, pipeline)
         });
         
@@ -383,17 +383,36 @@ impl MarketMatcher {
 
 
 
-    // 在 find_matches_directional_internal 函数中修改调用部分
-
-    async fn find_matches_directional_internal(
+    /// 同步版本：供 spawn_blocking 使用，实现真并行
+    fn find_matches_directional_sync(
         query_markets: &[Market],
         target_vectorizers: &CategoryVectorizerManager,
         category_mapper: &CategoryMapper,
         config: &MarketMatcherConfig,
         target_market_cache: &HashMap<String, Market>,
         validation_pipeline: &mut ValidationPipeline,
-        direction_label: &str,  // 新增：方向标识
-    ) -> Vec<(Market, Market, f64, String, String, bool)> {  // 返回更多信息
+        direction_label: &str,
+    ) -> Vec<(Market, Market, f64, String, String, bool)> {
+        Self::find_matches_directional_internal_impl(
+            query_markets,
+            target_vectorizers,
+            category_mapper,
+            config,
+            target_market_cache,
+            validation_pipeline,
+            direction_label,
+        )
+    }
+
+    fn find_matches_directional_internal_impl(
+        query_markets: &[Market],
+        target_vectorizers: &CategoryVectorizerManager,
+        category_mapper: &CategoryMapper,
+        config: &MarketMatcherConfig,
+        target_market_cache: &HashMap<String, Market>,
+        validation_pipeline: &mut ValidationPipeline,
+        direction_label: &str,
+    ) -> Vec<(Market, Market, f64, String, String, bool)> {
         let mut all_matches = Vec::new();
         let total = query_markets.len();
         

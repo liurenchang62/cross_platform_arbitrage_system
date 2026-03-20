@@ -16,14 +16,14 @@ pub const RETRY_INITIAL_DELAY_MS: u64 = 1000;
 pub const POLYMARKET_PAGE_LIMIT: u32 = 200;
 
 /// Polymarket 最大获取市场数
-pub const POLYMARKET_MAX_MARKETS: usize = 5000;
+pub const POLYMARKET_MAX_MARKETS: usize = 15000;
 
 // ==================== Kalshi 参数 ====================
 /// Kalshi 每页市场数
 pub const KALSHI_PAGE_LIMIT: u32 = 1000;
 
 /// Kalshi 最大获取市场数
-pub const KALSHI_MAX_MARKETS: usize = 5000;
+pub const KALSHI_MAX_MARKETS: usize = 15000;
 
 // ==================== 向量化参数 ====================
 /// 最大词汇表大小（降维用）

@@ -1,10 +1,9 @@
 // src/arbitrage_detector.rs
 use crate::market::MarketPrices;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Gas 费配置（固定值，单位 USDT）
-pub const GAS_FEE: f64 = 0.02;  // 每笔交易 $0.02
+pub const GAS_FEE_PER_TX: f64 = 0.02;  // 每笔交易 $0.02，两腿共 $0.04
 
 #[derive(Debug, Clone)]
 pub struct ArbitrageOpportunity {
@@ -19,6 +18,19 @@ pub struct ArbitrageOpportunity {
     pub gas_fee: f64,
     pub final_profit: f64,
     pub final_roi_percent: f64,
+    /// 以下为 100 USDT 本金模式
+    pub pm_optimal: f64,
+    pub kalshi_optimal: f64,
+    pub pm_avg_slipped: f64,
+    pub kalshi_avg_slipped: f64,
+    pub contracts: f64,
+    pub capital_used: f64,
+    pub fees_amount: f64,
+    pub gas_amount: f64,
+    pub net_profit_100: f64,
+    pub roi_100_percent: f64,
+    pub orderbook_pm_top5: Vec<(f64, f64)>,
+    pub orderbook_kalshi_top5: Vec<(f64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +68,122 @@ impl ArbitrageDetector {
 
     // 在 ArbitrageDetector 中添加新方法
 
+    /// 以 capital_usdt 为**每腿上限探针预算**：两腿各自最多用该金额吃单，取较小成交份数为对冲规模 n，
+    /// 再以 n 为基准对两边订单簿**重算**实现 n 份的精确成本（不写死紧边=100）。
+    pub fn calculate_arbitrage_100usdt(
+        &self,
+        pm_optimal: f64,
+        kalshi_optimal: f64,
+        pm_orderbook: Option<&[(f64, f64)]>,
+        kalshi_orderbook: Option<&[(f64, f64)]>,
+        pm_side: &str,
+        kalshi_side: &str,
+        needs_inversion: bool,
+        capital_usdt: f64,
+    ) -> Option<ArbitrageOpportunity> {
+        let total_cost_opt = pm_optimal + kalshi_optimal;
+        if total_cost_opt >= 1.0 || total_cost_opt <= 0.0 {
+            return None;
+        }
+        if capital_usdt <= 0.0 {
+            return None;
+        }
+
+        // 探针：两腿各用最多 capital_usdt，得到可行份数上界
+        let contracts_pm = if let Some(ob) = pm_orderbook {
+            if ob.is_empty() {
+                return None;
+            }
+            calculate_slippage_with_fixed_usdt(ob, capital_usdt).filled_contracts
+        } else if pm_optimal > 0.0 {
+            capital_usdt / pm_optimal
+        } else {
+            return None;
+        };
+        let contracts_ks = if let Some(ob) = kalshi_orderbook {
+            if ob.is_empty() {
+                return None;
+            }
+            calculate_slippage_with_fixed_usdt(ob, capital_usdt).filled_contracts
+        } else if kalshi_optimal > 0.0 {
+            capital_usdt / kalshi_optimal
+        } else {
+            return None;
+        };
+
+        let n = if contracts_pm > 0.0 && contracts_ks > 0.0 {
+            contracts_pm.min(contracts_ks)
+        } else {
+            return None;
+        };
+
+        // 以 n 为基准重算双腿真实成本（滑点已体现在成交价路径上）
+        let (c_pm, pm_avg) = if let Some(ob) = pm_orderbook {
+            cost_for_exact_contracts(ob, n)?
+        } else {
+            let c = n * pm_optimal;
+            (c, pm_optimal)
+        };
+        let (c_ks, kalshi_avg) = if let Some(ob) = kalshi_orderbook {
+            cost_for_exact_contracts(ob, n)?
+        } else {
+            let c = n * kalshi_optimal;
+            (c, kalshi_optimal)
+        };
+
+        let capital_used = c_pm + c_ks;
+        let gross = n * 1.0;
+        let fees_amount =
+            c_pm * self.fees.polymarket + c_ks * self.fees.kalshi;
+        let gas_amount = GAS_FEE_PER_TX * 2.0;
+        let net_profit_100 = gross - capital_used - fees_amount - gas_amount;
+
+        if net_profit_100 <= self.min_profit_threshold {
+            return None;
+        }
+        let roi_100 = if capital_used > 0.0 {
+            (net_profit_100 / capital_used) * 100.0
+        } else {
+            0.0
+        };
+
+        let inversion_note = if needs_inversion { " [Y/N颠倒]" } else { "" };
+        let strategy = format!("Buy {} on Polymarket + Buy {} on Kalshi{}", pm_side, kalshi_side, inversion_note);
+
+        let orderbook_pm_top5 = pm_orderbook
+            .map(|ob| ob.iter().take(5).copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let orderbook_kalshi_top5 = kalshi_orderbook
+            .map(|ob| ob.iter().take(5).copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        Some(ArbitrageOpportunity {
+            strategy,
+            kalshi_action: ("BUY".to_string(), kalshi_side.to_string(), kalshi_optimal),
+            polymarket_action: ("BUY".to_string(), pm_side.to_string(), pm_optimal),
+            total_cost: total_cost_opt,
+            gross_profit: 1.0 - total_cost_opt,
+            fees: self.fees.polymarket + self.fees.kalshi,
+            net_profit: (1.0 - total_cost_opt) - (self.fees.polymarket + self.fees.kalshi),
+            roi_percent: roi_100,
+            gas_fee: gas_amount,
+            final_profit: net_profit_100,
+            final_roi_percent: roi_100,
+            pm_optimal,
+            kalshi_optimal,
+            pm_avg_slipped: pm_avg,
+            kalshi_avg_slipped: kalshi_avg,
+            contracts: n,
+            capital_used,
+            fees_amount,
+            gas_amount,
+            net_profit_100,
+            roi_100_percent: roi_100,
+            orderbook_pm_top5,
+            orderbook_kalshi_top5,
+        })
+    }
+
     pub fn calculate_arbitrage_with_direction(
         &self,
         pm_prices: &MarketPrices,
@@ -87,7 +215,7 @@ impl ArbitrageDetector {
         }
         
         let net_profit = profit - total_fees;
-        let final_profit = net_profit - GAS_FEE;
+        let final_profit = net_profit - GAS_FEE_PER_TX * 2.0;
         
         if final_profit <= self.min_profit_threshold {
             return None;
@@ -118,9 +246,21 @@ impl ArbitrageDetector {
             fees: total_fees,
             net_profit,
             roi_percent: roi,
-            gas_fee: GAS_FEE,
+            gas_fee: GAS_FEE_PER_TX * 2.0,
             final_profit,
             final_roi_percent: roi,
+            pm_optimal: pm_price,
+            kalshi_optimal: kalshi_price,
+            pm_avg_slipped: pm_price,
+            kalshi_avg_slipped: kalshi_price,
+            contracts: 0.0,
+            capital_used: 0.0,
+            fees_amount: 0.0,
+            gas_amount: 0.0,
+            net_profit_100: 0.0,
+            roi_100_percent: 0.0,
+            orderbook_pm_top5: Vec::new(),
+            orderbook_kalshi_top5: Vec::new(),
         })
     }
 
@@ -157,7 +297,7 @@ impl ArbitrageDetector {
 
         let total_fees = self.fees.polymarket + self.fees.kalshi;
         let net_profit = slipped_profit - total_fees;
-        let final_profit = net_profit - GAS_FEE;
+        let final_profit = net_profit - GAS_FEE_PER_TX * 2.0;
 
         if final_profit <= self.min_profit_threshold {
             return None;
@@ -178,9 +318,21 @@ impl ArbitrageDetector {
             fees: total_fees,
             net_profit,
             roi_percent: (net_profit / slipped_cost) * 100.0,
-            gas_fee: GAS_FEE,
+            gas_fee: GAS_FEE_PER_TX * 2.0,
             final_profit,
             final_roi_percent: roi,
+            pm_optimal: opportunity.pm_optimal,
+            kalshi_optimal: opportunity.kalshi_optimal,
+            pm_avg_slipped: pm_slipped,
+            kalshi_avg_slipped: kalshi_slipped,
+            contracts: 0.0,
+            capital_used: 0.0,
+            fees_amount: 0.0,
+            gas_amount: 0.0,
+            net_profit_100: 0.0,
+            roi_100_percent: 0.0,
+            orderbook_pm_top5: Vec::new(),
+            orderbook_kalshi_top5: Vec::new(),
         })
     }
 
@@ -236,6 +388,18 @@ impl ArbitrageDetector {
                 gas_fee: 0.0,
                 final_profit: 0.0,
                 final_roi_percent: 0.0,
+                pm_optimal: pm_no_ask,
+                kalshi_optimal: kalshi_yes_ask,
+                pm_avg_slipped: pm_no_ask,
+                kalshi_avg_slipped: kalshi_yes_ask,
+                contracts: 0.0,
+                capital_used: 0.0,
+                fees_amount: 0.0,
+                gas_amount: 0.0,
+                net_profit_100: 0.0,
+                roi_100_percent: 0.0,
+                orderbook_pm_top5: Vec::new(),
+                orderbook_kalshi_top5: Vec::new(),
             });
         }
 
@@ -259,6 +423,18 @@ impl ArbitrageDetector {
                 gas_fee: 0.0,
                 final_profit: 0.0,
                 final_roi_percent: 0.0,
+                pm_optimal: pm_yes_ask,
+                kalshi_optimal: kalshi_no_ask,
+                pm_avg_slipped: pm_yes_ask,
+                kalshi_avg_slipped: kalshi_no_ask,
+                contracts: 0.0,
+                capital_used: 0.0,
+                fees_amount: 0.0,
+                gas_amount: 0.0,
+                net_profit_100: 0.0,
+                roi_100_percent: 0.0,
+                orderbook_pm_top5: Vec::new(),
+                orderbook_kalshi_top5: Vec::new(),
             });
         }
 
@@ -267,6 +443,32 @@ impl ArbitrageDetector {
 }
 
 // ==================== 滑点计算相关函数（需要公开导出）====================
+
+/// 从卖盘（价格升序）吃进**恰好** `n` 份合约。`n` 可为分数（与探针一致）。
+/// 流动性不足则返回 `None`。返回 `(总成本, 成交量加权均价)`。
+pub fn cost_for_exact_contracts(asks: &[(f64, f64)], n: f64) -> Option<(f64, f64)> {
+    if n <= 0.0 || !n.is_finite() {
+        return None;
+    }
+    const EPS: f64 = 1e-9;
+    let mut remaining = n;
+    let mut total_cost = 0.0;
+    for (price, size) in asks {
+        if remaining <= EPS {
+            break;
+        }
+        if *size <= 0.0 || *price <= 0.0 {
+            continue;
+        }
+        let take = remaining.min(*size);
+        total_cost += take * price;
+        remaining -= take;
+    }
+    if remaining > 1e-6 {
+        return None;
+    }
+    Some((total_cost, total_cost / n))
+}
 
 #[derive(Debug, Clone)]
 pub struct SlippageInfo {
@@ -391,5 +593,55 @@ pub fn parse_kalshi_orderbook(data: &Value, side: &str) -> Option<Vec<(f64, f64)
         Some(result)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod arb_tests {
+    use super::*;
+
+    #[test]
+    fn cost_for_exact_contracts_single_level() {
+        let ob = [(0.5, 100.0)];
+        let (c, avg) = cost_for_exact_contracts(&ob, 10.0).unwrap();
+        assert!((c - 5.0).abs() < 1e-9);
+        assert!((avg - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_for_exact_contracts_spans_levels() {
+        let ob = [(0.1, 50.0), (0.2, 50.0)];
+        let (c, avg) = cost_for_exact_contracts(&ob, 75.0).unwrap();
+        assert!((c - (50.0 * 0.1 + 25.0 * 0.2)).abs() < 1e-6);
+        assert!((avg - c / 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_for_exact_contracts_insufficient() {
+        let ob = [(0.5, 10.0)];
+        assert!(cost_for_exact_contracts(&ob, 20.0).is_none());
+    }
+
+    #[test]
+    fn arbitrage_probe_then_reprice_matches_n() {
+        let det = ArbitrageDetector::new(0.0);
+        let pm = [(0.001, 1_000_000.0), (0.01, 1_000_000.0)];
+        let ks = [(0.05, 100.0), (0.1, 10000.0)];
+        let opp = det
+            .calculate_arbitrage_100usdt(
+                0.001,
+                0.05,
+                Some(&pm),
+                Some(&ks),
+                "YES",
+                "YES",
+                false,
+                100.0,
+            )
+            .expect("opp");
+        assert!(opp.contracts > 0.0);
+        let (c_pm, _) = cost_for_exact_contracts(&pm, opp.contracts).unwrap();
+        let (c_ks, _) = cost_for_exact_contracts(&ks, opp.contracts).unwrap();
+        assert!((opp.capital_used - (c_pm + c_ks)).abs() < 0.01);
     }
 }

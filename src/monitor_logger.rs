@@ -47,14 +47,25 @@ impl MonitorLogger {
 
     pub fn log_opportunity(&self, opportunity: &crate::arbitrage_detector::ArbitrageOpportunity) -> Result<()> {
         let at = Utc::now();
-        let line = format!(
-            "[{}] 策略: {}, 成本: {:.3}, 净利: {:.3}, ROI: {:.1}%",
-            at.to_rfc3339(),
-            opportunity.strategy,
-            opportunity.total_cost,
-            opportunity.net_profit,
-            opportunity.roi_percent
-        );
+        let line = if opportunity.contracts > 0.0 {
+            format!(
+                "[{}] 策略: {}, 本金: ${:.2}, 净利: ${:.2}, ROI: {:.1}%",
+                at.to_rfc3339(),
+                opportunity.strategy,
+                opportunity.capital_used,
+                opportunity.net_profit_100,
+                opportunity.roi_100_percent
+            )
+        } else {
+            format!(
+                "[{}] 策略: {}, 成本: {:.3}, 净利: {:.3}, ROI: {:.1}%",
+                at.to_rfc3339(),
+                opportunity.strategy,
+                opportunity.total_cost,
+                opportunity.net_profit,
+                opportunity.roi_percent
+            )
+        };
         self.append_monitor_log(&line, &at)
     }
 
