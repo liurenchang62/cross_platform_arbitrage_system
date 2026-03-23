@@ -8,8 +8,18 @@ A **Rust** service that pairs prediction markets between **Polymarket** and **Ka
 
 - **Market ingestion**: Open markets via Polymarket Gamma API and Kalshi Trade API (configurable paging and caps).
 - **Matching**: TF-IDF-style vectors and cosine similarity; category keywords in `config/categories.toml` for filtering and boosting.
-- **Arbitrage checks**: Uses **best ask from the order book** on matched pairs; optional fixed-notional walk (e.g. 100 USDT) for slippage and estimated net PnL.
+- **Arbitrage checks** (see below): **full order-book walk** under a fixed notional cap per leg to compute **realized cost, fees, gas, and net PnL** — not a single “best price” shortcut for the main result.
 - **Tracking**: Keeps watching high-similarity pairs with periodic full refresh and incremental updates (see `src/query_params.rs`).
+
+### How arbitrage PnL is actually computed
+
+1. **Live books**: For each matched pair, the monitor fetches **current** Polymarket and Kalshi **order books** (HTTP), parses them into sorted ask levels `(price, size)`.
+2. **Fixed notional per leg**: Each side is probed with up to **100 USDT** (`trade_amount` in `main.rs`) to see how many contracts can be bought by **walking the depth** (`calculate_slippage_with_fixed_usdt`).
+3. **Hedge size**: The tradable size is **`min(contracts_pm, contracts_ks)`** so both legs can be filled.
+4. **True cost for that size**: For exactly that many contracts, the code recomputes cost on **both** books with **`cost_for_exact_contracts`** → **`capital_used`**, volume-weighted **`pm_avg_slipped` / `kalshi_avg_slipped`**, then fees + gas → **`net_profit_100`**. Opportunities are filtered on **`net_profit_100`**, not on top-of-book alone.
+5. **“Best ask” / `pm_optimal`**: That is simply the **first (cheapest) ask level** on the same parsed book — used for **slippage % vs. the depth-weighted average** and for some **marginal** fields in `ArbitrageOpportunity` (e.g. `total_cost` = sum of best asks). It is **not** the sole basis for the reported 100 USDT scenario profit.
+
+Implementation: `validate_arbitrage_pair` and `ArbitrageDetector::calculate_arbitrage_100usdt` in `src/main.rs` / `src/arbitrage_detector.rs`.
 - **Logging**: Runtime logs under `logs/`; unmatched items may go to `logs/unclassified/`.
 
 ## Requirements

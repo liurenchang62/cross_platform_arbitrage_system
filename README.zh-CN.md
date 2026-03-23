@@ -8,8 +8,18 @@
 
 - **市场拉取**：通过 Polymarket Gamma API、Kalshi Trade API 获取开放市场列表（可配置分页与上限）。
 - **智能匹配**：TF-IDF 风格向量化 + 余弦相似度；支持按 `config/categories.toml` 的类别关键词做约束与加权。
-- **套利检测**：在匹配市场对上，以**订单簿最优卖价**为准计算价差；可选按固定本金（如 100 USDT） walk 盘口估算滑点与净收益。
+- **套利检测**（见下节）：对匹配市场对**按真实订单簿多档吃单**，在**每腿固定本金上限**下计算**实际占用资金、手续费、Gas 与净利润**；主结果**不是**“只用第一档最优价”简化出来的。
 - **状态追踪**：对高相似度配对做持续跟踪，定期全量刷新与增量更新（参数见 `src/query_params.rs`）。
+
+### 套利利润在代码里到底怎么算
+
+1. **真实盘口**：对每个匹配对，分别请求 Polymarket、Kalshi 的**当前订单簿**（HTTP），解析为按价格排序的卖档 `(价, 量)`。
+2. **每腿固定本金上限**：两腿各自用最多 **100 USDT**（`main.rs` 里 `trade_amount`）在簿上**逐档吃单**，得到每腿能买到的份数（`calculate_slippage_with_fixed_usdt`）。
+3. **对冲规模**：取 **`min(PM 可买份数, Kalshi 可买份数)`**，保证两腿都能按该份数成交。
+4. **该份数下的真实成本**：对上述份数 `n`，在两边订单簿上用 **`cost_for_exact_contracts`** **重新精确扫档** → 得到 **`capital_used`**、加权均价 **`pm_avg_slipped` / `kalshi_avg_slipped`**，再扣手续费与 Gas → **`net_profit_100`**。是否算“有机会”主要看 **`net_profit_100`** 是否超过阈值，**不是**只看第一档价差。
+5. **和“最优价”的关系**：代码里的 `pm_optimal` / `kalshi_optimal` 只是**同一本真实订单簿**里**第一档（最低）卖价**，用于和深度加权均价比**滑点百分比**，以及结构体里部分**边际**字段（例如 `total_cost` = 两平台第一档价格之和）。**报告里的 100 USDT 场景净利润以第 4 步的全簿扫档结果为准。**
+
+对应实现：`src/main.rs` 的 `validate_arbitrage_pair`、`src/arbitrage_detector.rs` 的 `calculate_arbitrage_100usdt`。
 - **日志**：运行期写入 `logs/`，未匹配项可记入 `logs/unclassified/`。
 
 ## 环境要求
