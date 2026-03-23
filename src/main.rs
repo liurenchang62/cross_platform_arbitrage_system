@@ -20,7 +20,7 @@ mod tracking;
 mod query_params;
 mod category_vectorizer;  // 新增
 mod cycle_statistics;
-mod cycle_report;
+mod market_filter;
 
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
@@ -31,6 +31,7 @@ use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
 use monitor_logger::MonitorLogger;
 use crate::tracking::{MonitorState};
 use crate::query_params::{FULL_FETCH_INTERVAL, SIMILARITY_THRESHOLD};
+use crate::market_filter::filter_markets_by_resolution_horizon;
 use crate::arbitrage_detector::{
     orderbook_best_ask_price, parse_kalshi_orderbook, parse_polymarket_orderbook,
 };
@@ -172,7 +173,9 @@ async fn validate_arbitrage_pair(
     kalshi_side: &str,
     needs_inversion: bool,
     capital_usdt: f64,
-    _logger: &MonitorLogger,
+    cycle_id: usize,
+    cycle_phase: &str,
+    logger: &MonitorLogger,
 ) -> Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
     // 定价与套利一律以订单簿为准：最优价 = 解析后第一档（最低可买价），不用 Gamma/API 快照价
     let pm_orderbook_vec: Vec<(f64, f64)> = if let Some(tid) = pm_market.token_ids.first() {
@@ -234,6 +237,21 @@ async fn validate_arbitrage_pair(
     println!("     📅 {}", format_resolution_expiry("PM", pm_expiry));
     println!("     📅 {}", format_resolution_expiry("Kalshi", ks_expiry));
     println!("     ─────────────────────────────────────────────────────────");
+    println!("     📗 PM 订单簿(买{}) Top5:", pm_side);
+    for (j, (p, s)) in pm_orderbook_vec.iter().take(5).enumerate() {
+        println!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
+    }
+    if pm_orderbook_vec.is_empty() {
+        println!("         (无订单簿)");
+    }
+    println!("     📗 Kalshi 订单簿(买{}) Top5:", kalshi_side);
+    for (j, (p, s)) in kalshi_orderbook_vec.iter().take(5).enumerate() {
+        println!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
+    }
+    if kalshi_orderbook_vec.is_empty() {
+        println!("         (无订单簿)");
+    }
+    println!("     ─────────────────────────────────────────────────────────");
     println!("     📊 策略: Polymarket 买 {}  +  Kalshi 买 {}", pm_side, kalshi_side);
     println!("     ─────────────────────────────────────────────────────────");
     println!("     📊 对冲份数 n: {:.4}", opp.contracts);
@@ -249,6 +267,24 @@ async fn validate_arbitrage_pair(
     println!("        = 净利润:      ${:.2}", opp.net_profit_100);
     println!("        ROI:           {:.1}%", opp.roi_100_percent);
     println!("     ─────────────────────────────────────────────────────────");
+
+    if let Err(e) = logger.log_arbitrage_opportunity(
+        cycle_id,
+        cycle_phase,
+        &opp,
+        &pm_market.market_id,
+        &kalshi_market.market_id,
+        &pm_market.title,
+        &kalshi_market.title,
+        similarity,
+        pm_side,
+        kalshi_side,
+        needs_inversion,
+        pm_expiry,
+        ks_expiry,
+    ) {
+        eprintln!("         ⚠️ 写入监控 CSV 失败: {}", e);
+    }
 
     Some((opp, pm_expiry, ks_expiry))
 }
@@ -272,11 +308,17 @@ async fn run_full_match_cycle(
     println!("   📡 执行全量匹配...");
     
     // 获取全量市场
-    let polymarket_markets: Vec<Market> = polymarket.fetch_all_markets().await?;
-    let kalshi_markets: Vec<Market> = kalshi.fetch_all_markets().await?;
-    
-    println!("      Polymarket: {} 个市场, Kalshi: {} 个市场", 
-        polymarket_markets.len(), kalshi_markets.len());
+    let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
+    let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
+    let now = Utc::now();
+    let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
+    let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
+
+    println!(
+        "      Polymarket: {} 个市场 (21d 窗口内), Kalshi: {} 个市场 (21d 窗口内)",
+        polymarket_markets.len(),
+        kalshi_markets.len()
+    );
     
     println!("\n   🔄 重建索引...");
     matcher.fit_vectorizer(&kalshi_markets, &polymarket_markets)?;
@@ -316,6 +358,8 @@ async fn run_full_match_cycle(
             kalshi_side,
             *needs_inversion,
             trade_amount,
+            monitor_state.current_cycle,
+            "full_match",
             logger,
         )
         .await
@@ -329,10 +373,6 @@ async fn run_full_match_cycle(
                 pm_exp,
                 ks_exp,
             ));
-
-            if let Err(e) = logger.log_opportunity(&verified) {
-                eprintln!("         ⚠️ 记录日志失败: {}", e);
-            }
         }
     }
 
@@ -403,6 +443,8 @@ async fn run_tracking_cycle(
             &pair.kalshi_side,
             pair.needs_inversion,
             trade_amount,
+            monitor_state.current_cycle,
+            "price_track",
             logger,
         )
         .await
@@ -420,10 +462,6 @@ async fn run_tracking_cycle(
                 pm_exp,
                 ks_exp,
             ));
-
-            if let Err(e) = logger.log_opportunity(&verified) {
-                eprintln!("         ⚠️ 记录日志失败: {}", e);
-            }
         }
     }
 
@@ -444,23 +482,19 @@ async fn run_cycle(
 ) -> Result<CycleStats> {
     let start_time = Local::now();
     println!("🔄 开始新周期 #{} - {}", monitor_state.current_cycle, start_time.format("%H:%M:%S"));
-    
+
+    monitor_state.prune_tracked_beyond_resolution_horizon(Utc::now());
+
     let trade_amount = 100.0;
     let is_full_match_cycle = monitor_state.should_full_match();
 
-    // 下一全量匹配开始前：输出上一大周期总绩效（首次全量匹配前不输出）。
-    let big_period_preamble = if is_full_match_cycle && monitor_state.current_cycle > 0 {
-        let s = crate::cycle_statistics::flush_big_period_report_at_boundary(
-            monitor_state.current_cycle,
-            monitor_state.full_match_interval,
-        );
-        print!("{}", s);
-        s
-    } else {
-        String::new()
-    };
-    
-    let (new_matches, opportunities, mut report_body, full_roi_block) = if is_full_match_cycle {
+    // 大周期边界：只重置累计器，不输出「上一大周期总绩效」（小周期结束时的报告仍保留）。
+    if is_full_match_cycle && monitor_state.current_cycle > 0 {
+        crate::cycle_statistics::reset_big_period_accumulator();
+    }
+
+    // top10 / full_roi 仅在终端打印；CSV 仅追加套利行（无周期汇总行）。
+    let (new_matches, opportunities, _top10_block, _full_roi_block) = if is_full_match_cycle {
         // 全量匹配周期
         let (m, v, top10, full) = run_full_match_cycle(
             polymarket, kalshi, matcher, arb_detector, logger, 
@@ -479,36 +513,6 @@ async fn run_cycle(
     let elapsed = Local::now() - start_time;
     println!("   ⏱️ 周期完成, 耗时: {}ms", elapsed.num_milliseconds());
 
-    let footer = format!(
-        "   ⏱️ 周期完成, 耗时: {}ms\n📊 周期统计: 新匹配 {} 对, 套利 {} 个, 追踪 {} 对\n",
-        elapsed.num_milliseconds(),
-        new_matches,
-        opportunities,
-        monitor_state.tracked_pairs.len()
-    );
-    if let Some(ref full) = full_roi_block {
-        report_body.push_str(full);
-    }
-    report_body.push_str(&footer);
-
-    if !big_period_preamble.is_empty() {
-        report_body = format!("{}{}", big_period_preamble, report_body);
-    }
-
-    let header = format!(
-        "======== {} | 周期 #{} | {} ========",
-        Local::now().format("%Y-%m-%d %H:%M:%S"),
-        monitor_state.current_cycle,
-        if is_full_match_cycle {
-            "全量匹配"
-        } else {
-            "价格追踪"
-        }
-    );
-    if let Err(e) = crate::cycle_report::append_cycle_report(&header, &report_body) {
-        eprintln!("⚠️ 写入周期报告文件失败: {}", e);
-    }
-    
     Ok(CycleStats {
         new_matches,
         arbitrage_opportunities: opportunities,
@@ -521,13 +525,20 @@ async fn fetch_initial_markets(
     kalshi: &KalshiClient,
 ) -> Result<(Vec<Market>, Vec<Market>)> {
     println!("   📡 获取 Polymarket 市场...");
-    let polymarket_markets: Vec<Market> = polymarket.fetch_all_markets().await?;
-    println!("      ✅ 获取到 {} 个市场", polymarket_markets.len());
-    
+    let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
     println!("   📡 获取 Kalshi 市场...");
-    let kalshi_markets: Vec<Market> = kalshi.fetch_all_markets().await?;
-    println!("      ✅ 获取到 {} 个市场", kalshi_markets.len());
-    
+    let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
+
+    let now = Utc::now();
+    let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
+    let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
+
+    println!(
+        "      ✅ Polymarket: {} 个 (21d 窗口), Kalshi: {} 个 (21d 窗口)",
+        polymarket_markets.len(),
+        kalshi_markets.len()
+    );
+
     Ok((kalshi_markets, polymarket_markets))
 }
 
@@ -537,7 +548,7 @@ struct CycleStats {
     arbitrage_opportunities: usize,
 }
 
-/// 本周期利润 Top 10 文本（与终端 `println!` 逐行一致，供文件归档）
+/// 本周期利润 Top 10 文本（终端用；不含订单簿，簿档在每次 `validate_arbitrage_pair` 中已打印）
 fn format_top10_opportunities(opportunities: &[OpportunityRow]) -> String {
     use std::fmt::Write as _;
 
@@ -626,21 +637,6 @@ fn format_top10_opportunities(opportunities: &[OpportunityRow]) -> String {
         )
         .unwrap();
         writeln!(out, "   │  ROI: {:.1}%", opp.roi_100_percent).unwrap();
-        writeln!(out, "   │  ─────────────────────────────────────────────────────────────").unwrap();
-        writeln!(out, "   │  📗 PM 订单簿(买{}) Top5:", opp.polymarket_action.1).unwrap();
-        for (j, (p, s)) in opp.orderbook_pm_top5.iter().take(5).enumerate() {
-            writeln!(out, "   │      #{}. 价 {:.4} 量 {:.1}", j + 1, p, s).unwrap();
-        }
-        if opp.orderbook_pm_top5.is_empty() {
-            writeln!(out, "   │      (无订单簿)").unwrap();
-        }
-        writeln!(out, "   │  📗 Kalshi 订单簿(买{}) Top5:", opp.kalshi_action.1).unwrap();
-        for (j, (p, s)) in opp.orderbook_kalshi_top5.iter().take(5).enumerate() {
-            writeln!(out, "   │      #{}. 价 {:.4} 量 {:.1}", j + 1, p, s).unwrap();
-        }
-        if opp.orderbook_kalshi_top5.is_empty() {
-            writeln!(out, "   │      (无订单簿)").unwrap();
-        }
         writeln!(out, "   └────────────────────────────────────────────────────────────────").unwrap();
     }
     writeln!(out).unwrap();

@@ -1,6 +1,8 @@
 // src/tracking.rs
 use chrono::{DateTime, Utc};
+
 use crate::market::{Market, MarketPrices};
+use crate::market_filter::tracked_pair_exceeds_horizon;
 
 /// 追踪的套利对
 pub struct TrackedArbitrage {
@@ -98,5 +100,12 @@ impl MonitorState {
 
     pub fn get_active_pairs(&self) -> Vec<&TrackedArbitrage> {
         self.tracked_pairs.iter().filter(|p| p.active).collect()
+    }
+
+    /// 剔除任一侧「有解析日且晚于 horizon」的追踪对（与全量池筛选规则一致）。
+    pub fn prune_tracked_beyond_resolution_horizon(&mut self, now: DateTime<Utc>) {
+        self.tracked_pairs.retain(|p| {
+            !tracked_pair_exceeds_horizon(&p.pm_market, &p.kalshi_market, now)
+        });
     }
 }

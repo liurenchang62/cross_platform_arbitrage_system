@@ -650,6 +650,88 @@ impl ExactScoreVsGoalsTotalsValidator {
     }
 }
 
+/// ==================== 电竞「Will X win 大赛」vs 传统体育进球盘 ====================
+/// 例：PM「Will Cloud9 New York win DreamHack Major 2?」误配 Kalshi「… over 2.5 goals?」
+/// 仅靠队名/城市相似会高分，命题不同。要求 Will-win 侧含明确电竞语境，另一侧为 goals O/U，才拦截。
+pub struct EsportsTournamentWinnerVsSportsGoalsValidator;
+
+impl EsportsTournamentWinnerVsSportsGoalsValidator {
+    /// Polymarket 常见：Will \<team\> win \<赛事\>…（无 vs 头对头主结构）
+    fn is_will_side_win_event_proposition(title: &str) -> bool {
+        let main = title.split(" - ").next().unwrap_or(title).trim();
+        let lm = main.to_lowercase();
+        if lm.contains(" vs ") || lm.contains(" vs.") {
+            return false;
+        }
+        Regex::new(r"(?i)will\s+.+\s+win\s+")
+            .map(|re| re.is_match(main))
+            .unwrap_or(false)
+    }
+
+    fn has_esports_series_anchor(title: &str) -> bool {
+        let l = title.to_lowercase();
+        const ANCHORS: &[&str] = &[
+            "dreamhack",
+            "esl one",
+            "esl pro",
+            "esl challenge",
+            "esl ",
+            "blast",
+            "iem ",
+            " iem",
+            " vct",
+            "vct ",
+            "valorant champions",
+            "lck",
+            "lec",
+            "lcs",
+            "lol worlds",
+            "league of legends",
+            " worlds 20",
+            "the international",
+            "dota 2",
+            "dota2",
+            "dota ",
+            "counter-strike",
+            "counter strike",
+            "cs2",
+            "cs:go",
+            "cs go",
+            "faceit",
+            "pgl ",
+            " pgl",
+            "six invitational",
+            "rainbow six",
+            "rlcs",
+            "rocket league",
+            "overwatch",
+            "fortnite",
+            "pubg",
+            "starcraft",
+            "evo 20",
+            "capcom cup",
+            "tekken",
+            "smash bros",
+            "fighting games",
+            "esports",
+            "e-sports",
+        ];
+        ANCHORS.iter().any(|a| l.contains(a))
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        for (a, b) in [(pm_title, kalshi_title), (kalshi_title, pm_title)] {
+            if Self::is_will_side_win_event_proposition(a)
+                && Self::has_esports_series_anchor(a)
+                && ExactScoreVsGoalsTotalsValidator::is_goals_totals_line(b)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// ==================== 公开赛总冠军 vs 单场对阵 ====================
 /// 「Will X win the WTA Miami Open?」与「Miami Open: A vs B」不能匹配
 pub struct TournamentOutrightVsMatchValidator;
@@ -1521,6 +1603,16 @@ impl ValidationPipeline {
             return None;
         }
 
+        // 1.4b2 电竞 Will X win 系列赛事 vs 传统体育进球 O/U（队名相似易误配）
+        if !EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(
+                pm_title,
+                kalshi_title,
+                "电竞赛事夺冠命题与体育进球Totals不能匹配",
+            );
+            return None;
+        }
+
         // 1.4c 公开赛/巡回赛总冠军 vs 带赛事前缀的单场对阵
         if !TournamentOutrightVsMatchValidator::allows_pair(pm_title, kalshi_title) {
             self.record_filter(pm_title, kalshi_title, "公开赛总冠军与单场对阵不能匹配");
@@ -2005,6 +2097,30 @@ mod tests {
         assert!(ExactScoreVsGoalsTotalsValidator::allows_pair(
             "Frankfurt at Mainz: Totals - Over 2.5 goals scored",
             "Mainz vs Frankfurt: Over 2.5 goals?"
+        ));
+    }
+
+    #[test]
+    fn test_esports_will_win_major_vs_sports_goals_rejected() {
+        let pm = "Will Cloud9 New York win DreamHack Major 2?";
+        let ks = "New York R wins by over 2.5 goals? - New York R wins by over 2.5 goals";
+        assert!(!EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm, ks));
+
+        let mut pipe = ValidationPipeline::new();
+        assert!(
+            pipe.validate(pm, ks, 0.95, "esports").is_none(),
+            "DreamHack 夺冠盘不应与 NHL/足球进球盘配对"
+        );
+
+        // 对侧非 goals Totals：不拦截
+        assert!(EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(
+            "Will FaZe win IEM Cologne?",
+            "FaZe vs NaVi Winner? - FaZe"
+        ));
+        // 无电竞语境的 Will win：不拦截（避免误伤足球等）
+        assert!(EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(
+            "Will Arsenal win the Premier League?",
+            "Arsenal vs Chelsea: Over 2.5 goals?"
         ));
     }
 

@@ -74,7 +74,7 @@ impl CategoryVectorizer {
         
         if !index_items.is_empty() {
             if total > 1000 {
-                println!("          构建 K-D Tree ({} 个点)...", index_items.len());
+                println!("          构建精确余弦索引 ({} 条向量)...", index_items.len());
             }
             self.index.build(index_items)?;
         }

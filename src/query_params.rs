@@ -34,5 +34,14 @@ pub const MAX_VOCAB_SIZE: Option<usize> = None;
 /// 相似度阈值
 pub const SIMILARITY_THRESHOLD: f64 = 0.8;
 
+/// 每个 (query, 类别) 在索引中保留的候选条数（精确按余弦排序后截断）。
+/// 仅当提高此值时才会扩大初筛候选集；降低可能影响召回，变更前应做审计对比。
+pub const SIMILARITY_TOP_K: usize = 7;
+
 /// 全量获取周期（每 N 个追踪周期执行一次全量获取）
 pub const FULL_FETCH_INTERVAL: usize = 180;
+
+// ==================== 市场时间窗口 ====================
+/// 仅保留解析日在「当前 UTC 时间 + 本天数」及以内的市场；无解析日期的市场保留。
+/// 有日期且解析日晚于该截止的剔除。
+pub const RESOLUTION_HORIZON_DAYS: i64 = 21;

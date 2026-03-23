@@ -1,10 +1,10 @@
 // market_matcher.rs
-//! 市场匹配器，使用 TF-IDF + K-D Tree 实现快速准确的市场匹配
+//! 市场匹配器：TF-IDF（L2 归一化）+ **按类精确余弦 Top-K** 候选生成，再经二筛。
 
 use crate::market::Market;
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
-use crate::query_params::SIMILARITY_THRESHOLD;
+use crate::query_params::{SIMILARITY_THRESHOLD, SIMILARITY_TOP_K};
 use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
 use crate::text_vectorizer::VectorizerConfig;
 use crate::validation::ValidationPipeline;
@@ -474,7 +474,7 @@ impl MarketMatcher {
                     let similar = vectorizer.find_similar(
                         &query_market.title,
                         config.similarity_threshold,
-                        5,
+                        SIMILARITY_TOP_K,
                     );
 
                     for (item, similarity) in similar {

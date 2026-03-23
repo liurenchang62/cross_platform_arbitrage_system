@@ -67,98 +67,10 @@ pub fn record_opportunity(opp: &ArbitrageOpportunity) {
     bp.sum_net_profit += opp.net_profit_100;
 }
 
-/// 在**下一全量匹配周期开始前**调用（`current_cycle > 0` 且 `should_full_match()`）。
-/// 输出「上一大周期」总绩效并清零大周期累加器；同时附带自启动以来累计快照。
-/// 返回与终端一致的文本，供写入 `cycle_report`。
-pub fn flush_big_period_report_at_boundary(current_cycle: usize, interval: usize) -> String {
-    use std::fmt::Write as _;
-
-    let ended_period_no = current_cycle / interval;
-    let n_track = interval.saturating_sub(1);
-
-    let bp = std::mem::take(&mut *BIG_PERIOD.lock().unwrap());
-    let g = GLOBAL.lock().unwrap().clone();
-
-    let bp_margin = if bp.sum_capital > f64::EPSILON {
-        bp.sum_net_profit / bp.sum_capital * 100.0
-    } else {
-        0.0
-    };
-    let global_margin = if g.sum_capital > f64::EPSILON {
-        g.sum_net_profit / g.sum_capital * 100.0
-    } else {
-        0.0
-    };
-
-    let mut out = String::new();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "╔══════════════════════════════════════════════════════════════════════╗"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "║  📊 上一大周期总绩效（大周期 #{} 已结束 · 1 次全量匹配 + {} 次价格追踪）     ║",
-        ended_period_no, n_track
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "╚══════════════════════════════════════════════════════════════════════╝"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "┌─ 本大周期内累计（结帐于下一匹配周期开始前）────────────────────────────"
-    )
-    .unwrap();
-    writeln!(out, "│  套利识别次数:               {}", bp.arb_hits).unwrap();
-    writeln!(out, "│  总本金 Σcapital:           ${:.2}", bp.sum_capital).unwrap();
-    writeln!(out, "│  总 Gas Σgas:               ${:.2}", bp.sum_gas).unwrap();
-    writeln!(out, "│  总手续费 Σfees:            ${:.2}", bp.sum_fees).unwrap();
-    writeln!(out, "│  总回报(兑付额 Σn):         ${:.2}", bp.sum_gross_payout).unwrap();
-    writeln!(out, "│  总净利润 Σnet:             ${:.2}", bp.sum_net_profit).unwrap();
-    writeln!(
-        out,
-        "│  本大周期利润率 (Σnet/Σcapital): {:.2}%",
-        bp_margin
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "└────────────────────────────────────────────────────────────────────────"
-    )
-    .unwrap();
-
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "┌─ 自进程启动以来累计（每次识别均独立计数，含全量+追踪周期）────────────────"
-    )
-    .unwrap();
-    writeln!(out, "│  已完成全量匹配周期数 N:     {}", g.full_match_cycles_completed).unwrap();
-    writeln!(out, "│  套利识别总次数:             {}", g.arb_hits).unwrap();
-    writeln!(out, "│  总成本 Σcapital:           ${:.2}", g.sum_capital).unwrap();
-    writeln!(out, "│  总 Gas Σgas:               ${:.2}", g.sum_gas).unwrap();
-    writeln!(out, "│  总手续费 Σfees:            ${:.2}", g.sum_fees).unwrap();
-    writeln!(out, "│  总回报(兑付额 Σn):         ${:.2}", g.sum_gross_payout).unwrap();
-    writeln!(out, "│  总净利润 Σnet:             ${:.2}", g.sum_net_profit).unwrap();
-    writeln!(
-        out,
-        "│  整体利润率 (Σnet/Σcapital): {:.2}%",
-        global_margin
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "└────────────────────────────────────────────────────────────────────────"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-
-    out
+/// 在**下一全量匹配周期开始前**调用（`current_cycle > 0` 且 `should_full_match()`）：
+/// 仅清零「大周期」累加器 `BIG_PERIOD`，**不**打印、不写入任何大周期汇总报表。
+pub fn reset_big_period_accumulator() {
+    let _ = std::mem::take(&mut *BIG_PERIOD.lock().unwrap());
 }
 
 /// 每个 **全量匹配周期** 在验证与 ROI Top10 打印完成后调用（**不再**在此处输出自启动累计，改到大周期边界）。
