@@ -2,82 +2,90 @@
 
 [English](README.md) | **简体中文**
 
-在 **Polymarket** 与 **Kalshi** 之间，基于标题语义相似度自动配对预测市场，周期性拉取行情与订单簿，检测潜在跨平台套利机会并记录日志的 **Rust 监控程序**（只读分析，不自动下单）。
+## 项目简介
+
+`arbitrage-monitor` 是一款 **Rust** 实现的监控程序：在 **Polymarket** 与 **Kalshi** 之间基于文本相似度与类别规则发现可对齐的预测市场，维护高置信配对并周期性评估其**可执行层面的经济结果**。定价与盈亏以**实时订单簿**解析结果为依据；程序**只读分析**，不发起下单。
+
+整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及将结果写入 `logs/` 等结构化日志。
 
 ## 功能概览
 
-- **市场拉取**：通过 Polymarket Gamma API、Kalshi Trade API 获取开放市场列表（可配置分页与上限）。
-- **智能匹配**：TF-IDF 风格向量化 + 余弦相似度；支持按 `config/categories.toml` 的类别关键词做约束与加权。
-- **套利检测**（见下节）：对匹配市场对**按真实订单簿多档吃单**，在**每腿固定本金上限**下计算**实际占用资金、手续费、Gas 与净利润**；主结果**不是**“只用第一档最优价”简化出来的。
-- **状态追踪**：对高相似度配对做持续跟踪，定期全量刷新与增量更新（参数见 `src/query_params.rs`）。
+- **市场数据**：通过 Polymarket Gamma API、Kalshi Trade API 获取开放市场，分页与数量上限可配置。
+- **智能匹配**：TF-IDF 风格文本向量与余弦相似度；结合 `config/categories.toml` 中的类别关键词做约束与加权。
+- **订单簿场景盈亏**：对每个候选配对，在双方**卖档深度**上按**固定本金上限**模拟吃单，得到占用资金、手续费、Gas 假设下的净利润等指标（见 **订单簿盈亏模型**）。
+- **状态追踪**：维护追踪列表，按参数进行全量重建与周期更新（`src/query_params.rs`）。
+- **日志**：周期输出与监控 CSV 写入 `logs/`；未匹配或低信号样本可记入 `logs/unclassified/`。
 
-### 套利利润在代码里到底怎么算
+## 订单簿盈亏模型
 
-1. **真实盘口**：对每个匹配对，分别请求 Polymarket、Kalshi 的**当前订单簿**（HTTP），解析为按价格排序的卖档 `(价, 量)`。
-2. **每腿固定本金上限**：两腿各自用最多 **100 USDT**（`main.rs` 里 `trade_amount`）在簿上**逐档吃单**，得到每腿能买到的份数（`calculate_slippage_with_fixed_usdt`）。
-3. **对冲规模**：取 **`min(PM 可买份数, Kalshi 可买份数)`**，保证两腿都能按该份数成交。
-4. **该份数下的真实成本**：对上述份数 `n`，在两边订单簿上用 **`cost_for_exact_contracts`** **重新精确扫档** → 得到 **`capital_used`**、加权均价 **`pm_avg_slipped` / `kalshi_avg_slipped`**，再扣手续费与 Gas → **`net_profit_100`**。是否算“有机会”主要看 **`net_profit_100`** 是否超过阈值，**不是**只看第一档价差。
-5. **和“最优价”的关系**：代码里的 `pm_optimal` / `kalshi_optimal` 只是**同一本真实订单簿**里**第一档（最低）卖价**，用于和深度加权均价比**滑点百分比**，以及结构体里部分**边际**字段（例如 `total_cost` = 两平台第一档价格之和）。**报告里的 100 USDT 场景净利润以第 4 步的全簿扫档结果为准。**
+用于展示与排序的场景（如周期 Top 10、`net_profit_100`）在代码中定义为：
 
-对应实现：`src/main.rs` 的 `validate_arbitrage_pair`、`src/arbitrage_detector.rs` 的 `calculate_arbitrage_100usdt`。
-- **日志**：运行期写入 `logs/`，未匹配项可记入 `logs/unclassified/`。
+1. **订单簿快照**  
+   对每个已匹配市场对，程序通过 HTTP 获取双方**当前订单簿**，将可买流动性解析为按价格**升序排列的卖档** `(价格, 数量)`。
+
+2. **单腿本金上限**  
+   每条腿最多使用 **100 USDT**（`src/main.rs` 中的 `trade_amount`）。在对应卖档上**逐档累加**直至达到该上限或档位耗尽（`src/arbitrage_detector.rs` 中的 `calculate_slippage_with_fixed_usdt`），得到该腿在给定本金下**可成交的合约份数**。
+
+3. **对冲规模**  
+   取两腿可成交份数的**较小值**作为统一成交规模 **n**，以保证两腿可按相同份数同时建仓。
+
+4. **规模 n 下的成本与利润**  
+   对规模 **n**，在两侧订单簿上再次按档位精确计算总支出与**成交量加权均价**（`cost_for_exact_contracts`），得到 **`capital_used`**；再扣除平台手续费与预设 Gas，得到 **`net_profit_100`**。是否将该配对视为「存在机会」由 **`net_profit_100`** 是否高于检测器配置的最小阈值决定；该判定基于上述**全深度扫档**结果，而非单一报价层面的简化。
+
+**实现位置**：`src/main.rs` 中的 `validate_arbitrage_pair`；`src/arbitrage_detector.rs` 中的 `calculate_arbitrage_100usdt`、`calculate_slippage_with_fixed_usdt`、`cost_for_exact_contracts`。
 
 ## 环境要求
 
-- **Rust**：1.70+（建议 stable，`edition = "2021"`）
-- 网络可访问上述 API（无需登录即可拉取公开行情；若 Kalshi 策略变更请以官方文档为准）
+- **Rust** 1.70+（建议使用 stable，`edition = "2021"`）
+- 可访问上述公开 API（若端点或合规策略变更，请以平台最新文档为准）
 
 ## 快速开始
 
 ```bash
-# 调试运行
-cargo run
-
-# 发布构建（推荐长时间运行）
-cargo run --release
+cargo run              # 调试
+cargo run --release    # 长时间运行建议
 ```
 
-首次运行前请确保存在 **`config/categories.toml`**（仓库已带示例配置）。
+首次运行前请确保存在 **`config/categories.toml`**（仓库已附带示例）。
 
 ## 配置说明
 
-| 位置 | 作用 |
+| 路径 | 说明 |
 |------|------|
-| `config/categories.toml` | 类别名称、权重与关键词；用于标题分类与匹配约束 |
-| `src/query_params.rs` | 请求间隔、分页上限、相似度阈值 `SIMILARITY_THRESHOLD`、`SIMILARITY_TOP_K`、全量刷新周期 `FULL_FETCH_INTERVAL`、解析日窗口 `RESOLUTION_HORIZON_DAYS` 等 |
+| `config/categories.toml` | 类别名称、权重、关键词，用于分类与匹配 |
+| `src/query_params.rs` | 请求节奏、分页上限、`SIMILARITY_THRESHOLD`、`SIMILARITY_TOP_K`、`FULL_FETCH_INTERVAL`、`RESOLUTION_HORIZON_DAYS` 等 |
 
 ### 环境变量（可选）
 
-- **`POLYMARKET_TAG_SLUG`**：若设置，Polymarket 侧可按 tag 过滤拉取市场（见 `clients.rs` 实现）。
+- **`POLYMARKET_TAG_SLUG`**：设置后 Polymarket 拉取可按 tag 过滤（见 `src/clients.rs`）。
 
-## 项目结构（简要）
+## 仓库结构
 
 ```
 src/
-  main.rs              # 入口与主循环
-  clients.rs           # Polymarket / Kalshi HTTP 客户端
-  market_matcher.rs    # 匹配与索引构建
-  text_vectorizer.rs   # 文本向量化
-  vector_index.rs      # 向量检索
-  arbitrage_detector.rs# 套利与滑点相关计算
-  query_params.rs      # 全局查询与匹配参数
-  validation.rs        # 校验逻辑
-  tracking.rs          # 监控周期状态
-  ...
+  main.rs               入口与监控主循环
+  clients.rs            Polymarket / Kalshi HTTP 客户端
+  market_matcher.rs     匹配与索引构建
+  text_vectorizer.rs    文本向量化
+  vector_index.rs       向量检索
+  arbitrage_detector.rs 订单簿遍历、费用与盈亏辅助逻辑
+  query_params.rs       全局调参常量
+  validation.rs         校验辅助
+  tracking.rs           周期监控状态
 config/
-  categories.toml      # 类别配置
+  categories.toml
 docs/
-  MATCHING_VERIFICATION.md  # 匹配行为说明与验证笔记
+  MATCHING_VERIFICATION.md
 ```
 
-更细的匹配与索引行为可参考 **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**。
+匹配与索引的进一步说明见 **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**。
 
 ## 免责声明
 
-- 本工具仅供学习与研究，**不构成投资建议**。
-- 预测市场存在规则差异、结算风险、流动性不足与 API 延迟；展示的收益与滑点为模型估算，**实盘结果可能不同**。
-- 使用第三方 API 时请遵守各平台服务条款与适用法规。
+- 仅供**研究与学习**，不构成投资建议。
+- 预测市场在规则、结算、流动性与时延上存在差异；展示盈亏为基于快照与假设（手续费、Gas 等）的**模型输出**，**实盘结果可能不同**。
+- 使用第三方 API 须遵守各平台服务条款与适用法律法规。
 
 ## 许可证
 
-未随仓库附带许可证文件时，默认保留所有权利；如需开源请自行添加 `LICENSE`。
+若仓库未包含 `LICENSE` 文件，默认保留所有权利；若计划以开放许可分发，请自行补充许可证文件。

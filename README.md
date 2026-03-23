@@ -2,30 +2,42 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A **Rust** service that pairs prediction markets between **Polymarket** and **Kalshi** using title similarity, periodically fetches quotes and order books, flags potential cross-venue spreads, and writes logs. **Read-only analysis** — it does not place orders automatically.
+## Overview
+
+`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. It performs **read-only analysis** and does not submit orders.
+
+The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, and structured logging under `logs/`.
 
 ## Features
 
-- **Market ingestion**: Open markets via Polymarket Gamma API and Kalshi Trade API (configurable paging and caps).
-- **Matching**: TF-IDF-style vectors and cosine similarity; category keywords in `config/categories.toml` for filtering and boosting.
-- **Arbitrage checks** (see below): **full order-book walk** under a fixed notional cap per leg to compute **realized cost, fees, gas, and net PnL** — not a single “best price” shortcut for the main result.
-- **Tracking**: Keeps watching high-similarity pairs with periodic full refresh and incremental updates (see `src/query_params.rs`).
+- **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
+- **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
+- **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
+- **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/query_params.rs`).
+- **Logging**: Cycle outputs and monitor CSVs under `logs/`; unmatched or low-signal items may be recorded under `logs/unclassified/`.
 
-### How arbitrage PnL is actually computed
+## Order-book PnL model
 
-1. **Live books**: For each matched pair, the monitor fetches **current** Polymarket and Kalshi **order books** (HTTP), parses them into sorted ask levels `(price, size)`.
-2. **Fixed notional per leg**: Each side is probed with up to **100 USDT** (`trade_amount` in `main.rs`) to see how many contracts can be bought by **walking the depth** (`calculate_slippage_with_fixed_usdt`).
-3. **Hedge size**: The tradable size is **`min(contracts_pm, contracts_ks)`** so both legs can be filled.
-4. **True cost for that size**: For exactly that many contracts, the code recomputes cost on **both** books with **`cost_for_exact_contracts`** → **`capital_used`**, volume-weighted **`pm_avg_slipped` / `kalshi_avg_slipped`**, then fees + gas → **`net_profit_100`**. Opportunities are filtered on **`net_profit_100`**, not on top-of-book alone.
-5. **“Best ask” / `pm_optimal`**: That is simply the **first (cheapest) ask level** on the same parsed book — used for **slippage % vs. the depth-weighted average** and for some **marginal** fields in `ArbitrageOpportunity` (e.g. `total_cost` = sum of best asks). It is **not** the sole basis for the reported 100 USDT scenario profit.
+The scenario used for reporting (e.g. Top-10 and `net_profit_100`) is defined as follows:
 
-Implementation: `validate_arbitrage_pair` and `ArbitrageDetector::calculate_arbitrage_100usdt` in `src/main.rs` / `src/arbitrage_detector.rs`.
-- **Logging**: Runtime logs under `logs/`; unmatched items may go to `logs/unclassified/`.
+1. **Order-book snapshots**  
+   For a matched pair, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting liquidity into **ascending ask ladders** `(price, size)`.
+
+2. **Per-leg notional cap**  
+   Each leg is allocated a maximum spend of **100 USDT** (`trade_amount` in `src/main.rs`). The ladder is traversed level by level until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `src/arbitrage_detector.rs`), yielding a **fillable contract count** per venue.
+
+3. **Hedged size**  
+   The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the same size.
+
+4. **Cost and profit at size n**  
+   For exactly **n** contracts, per-leg total cost and **volume-weighted average prices** are recomputed by walking each ladder again (`cost_for_exact_contracts`). Combined legs yield **`capital_used`**. Platform fees and a fixed gas assumption are subtracted to obtain **`net_profit_100`**. A row is treated as an actionable opportunity when **`net_profit_100`** exceeds the detector’s configured minimum; this gate is applied to the depth-based result, not to a single-level quote in isolation.
+
+**Implementation reference**: `validate_arbitrage_pair` in `src/main.rs`; `calculate_arbitrage_100usdt`, `calculate_slippage_with_fixed_usdt`, and `cost_for_exact_contracts` in `src/arbitrage_detector.rs`.
 
 ## Requirements
 
 - **Rust** 1.70+ (stable recommended, `edition = "2021"`)
-- Network access to the above APIs (public market data; if Kalshi policy changes, follow their official docs)
+- Network access to the above public APIs (verify against current Kalshi and Polymarket documentation if endpoints or policies change)
 
 ## Quick start
 
@@ -34,47 +46,46 @@ cargo run              # debug
 cargo run --release    # recommended for long runs
 ```
 
-Ensure **`config/categories.toml`** exists before the first run (included in the repo).
+Ensure **`config/categories.toml`** exists before the first run (included in the repository).
 
 ## Configuration
 
 | Path | Purpose |
 |------|---------|
-| `config/categories.toml` | Category names, weights, keywords for classification and matching |
+| `config/categories.toml` | Category names, weights, and keywords for classification and matching |
 | `src/query_params.rs` | Request pacing, page limits, `SIMILARITY_THRESHOLD`, `SIMILARITY_TOP_K`, `FULL_FETCH_INTERVAL`, `RESOLUTION_HORIZON_DAYS`, etc. |
 
 ### Optional environment variables
 
-- **`POLYMARKET_TAG_SLUG`**: When set, Polymarket fetches may be filtered by tag (see `clients.rs`).
+- **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted by tag (see `src/clients.rs`).
 
-## Repository layout (short)
+## Repository layout
 
 ```
 src/
-  main.rs               entry + main loop
-  clients.rs            Polymarket / Kalshi HTTP clients
-  market_matcher.rs     matching + index build
-  text_vectorizer.rs    text vectorization
-  vector_index.rs       vector search
-  arbitrage_detector.rs spread + slippage helpers
-  query_params.rs       global tuning constants
-  validation.rs         validation
-  tracking.rs           monitor cycle state
-  ...
+  main.rs               Entry point and monitor loop
+  clients.rs            HTTP clients for Polymarket and Kalshi
+  market_matcher.rs     Matching and index construction
+  text_vectorizer.rs    Text vectorization
+  vector_index.rs       Vector search
+  arbitrage_detector.rs Order-book traversal, fees, and PnL helpers
+  query_params.rs       Shared tuning constants
+  validation.rs         Validation helpers
+  tracking.rs           Per-cycle monitor state
 config/
   categories.toml
 docs/
   MATCHING_VERIFICATION.md
 ```
 
-See **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)** for matching/index notes.
+Further detail on matching and indexing: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
 
 ## Disclaimer
 
-- For **learning and research only** — not investment advice.
-- Prediction markets differ in rules, settlement, liquidity, and API latency; shown PnL/slippage are **estimates** and live results may differ.
-- Comply with each platform’s terms of service and applicable laws when using third-party APIs.
+- Provided for **research and educational use** only; not investment advice.
+- Prediction markets differ in rules, settlement, liquidity, and latency; reported PnL is a **model output** from snapshots and assumptions (fees, gas), and **live results may differ**.
+- Comply with each platform’s terms of service and applicable law.
 
 ## License
 
-If no `LICENSE` file is present, all rights are reserved; add a `LICENSE` file if you intend to open-source the project.
+If no `LICENSE` file is present, all rights are reserved; add one if you intend to distribute under open terms.
