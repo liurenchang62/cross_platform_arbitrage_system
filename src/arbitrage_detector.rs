@@ -533,6 +533,12 @@ pub fn calculate_slippage_with_fixed_usdt(
     }
 }
 
+/// 订单簿已按买入价升序排列时，第一档即为最优（最低）可成交价。
+#[inline]
+pub fn orderbook_best_ask_price(levels: &[(f64, f64)]) -> Option<f64> {
+    levels.first().map(|(p, _)| *p)
+}
+
 pub fn parse_polymarket_orderbook(data: &Value, side: &str) -> Option<Vec<(f64, f64)>> {
     if side == "YES" {
         let asks = data.get("asks")?.as_array()?;

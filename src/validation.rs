@@ -1,8 +1,17 @@
 // src/validation.rs
 //! 二筛模块：对向量匹配结果进行精确验证
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
+
+/// 州缩写-选区号（如 ga-14、wv-02），用于选举语境
+static ELECTORAL_STATE_DISTRICT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b[a-z]{2}-\d{1,2}\b").expect("ELECTORAL_STATE_DISTRICT_RE")
+});
+static ELECTORAL_NTH_PLACE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b\d+(?:st|nd|rd|th)\s+place\b").expect("ELECTORAL_NTH_PLACE_RE")
+});
 
 /// 安全词列表（单方有日期时放行）
 const SAFE_WORDS: [&str; 6] = [
@@ -233,10 +242,17 @@ fn kalshi_head_to_head_pair_required(title: &str) -> bool {
 }
 
 fn two_team_sets_consistent(pm_a: &str, pm_b: &str, ks_a: &str, ks_b: &str) -> bool {
-    let p1 = strip_team_event_prefix(pm_a);
-    let p2 = strip_team_event_prefix(pm_b);
-    let k1 = strip_team_event_prefix(ks_a);
-    let k2 = strip_team_event_prefix(ks_b);
+    // 先去掉「 - VCL EMEA: Group D」等尾部元数据，再 strip「Valorant:」类前缀。
+    // 否则 PM 队2 含 `... - Foo: Bar` 时 `rfind(':')` 会误把队名收成 `Bar`（如 Group D），
+    // 导致与 Kalshi 两队校验失败并落入默认 1Y1N，颠倒盘无法识别。
+    let pm_a = FinalsConsistencyValidator::trim_team_suffix(pm_a);
+    let pm_b = FinalsConsistencyValidator::trim_team_suffix(pm_b);
+    let ks_a = FinalsConsistencyValidator::trim_team_suffix(ks_a);
+    let ks_b = FinalsConsistencyValidator::trim_team_suffix(ks_b);
+    let p1 = strip_team_event_prefix(&pm_a);
+    let p2 = strip_team_event_prefix(&pm_b);
+    let k1 = strip_team_event_prefix(&ks_a);
+    let k2 = strip_team_event_prefix(&ks_b);
     (names_match(&p1, &k1) && names_match(&p2, &k2)) || (names_match(&p1, &k2) && names_match(&p2, &k1))
 }
 
@@ -990,8 +1006,8 @@ impl WinnerMarketValidator {
             }
         }
         
-        // 套利必须覆盖两队。颠倒=2Y/2N，非颠倒=1Y1N（队名须去前缀/去 Map 后缀再比）
-        let pt1 = strip_team_event_prefix(&pm_team1);
+        // 套利必须覆盖两队。颠倒=2Y/2N，非颠倒=1Y1N（队名须先 trim 尾部「 - 分组」再去赛事前缀）
+        let pt1 = strip_team_event_prefix(&FinalsConsistencyValidator::trim_team_suffix(&pm_team1));
         let pt2 = strip_team_event_prefix(&FinalsConsistencyValidator::trim_team_suffix(&pm_team2));
         if names_match(&pt1, &ks_winner) {
             // Kalshi 问队1胜：PM Yes(队1) + Kalshi No(队2)，1Y1N 无颠倒
@@ -1322,6 +1338,101 @@ impl NumberComparator {
     }
 }
 
+/// ==================== 选举/政治命题：政党赢席 vs 候选人提名、名次 vs 获胜 ====================
+/// 剔除向量相似但兑付条件不同的高误配（如 PM 大选党赢席 vs Kalshi 初选提名；「赢」vs「第二名」）。
+pub struct ElectoralPropositionValidator;
+
+impl ElectoralPropositionValidator {
+    fn looks_political_election_context(l: &str) -> bool {
+        l.contains("house seat")
+            || l.contains("u.s. house")
+            || l.contains("us house")
+            || (l.contains("senate") && (l.contains("seat") || l.contains("race") || l.contains("election")))
+            || l.contains("congressional district")
+            || l.contains("congressional ")
+            || l.contains("special election")
+            || l.contains("governor")
+            || l.contains("mayor")
+            || l.contains("presidential")
+            || l.contains("primary")
+            || l.contains("nominee")
+            || l.contains("nomination")
+            || l.contains("democratic party")
+            || l.contains("republican party")
+            || l.contains("the gop")
+            || l.contains(" gop ")
+            || ELECTORAL_STATE_DISTRICT_RE.is_match(l)
+    }
+
+    /// 如：Democratic Party win the WV-02 House seat（非提名）
+    fn is_party_wins_seat_proposition(l: &str) -> bool {
+        if l.contains("nominee") || l.contains("nomination") {
+            return false;
+        }
+        let has_party = l.contains("democratic party")
+            || l.contains("republican party")
+            || l.contains("the gop")
+            || l.contains(" gop ");
+        let has_seat = l.contains("house seat")
+            || l.contains("congressional")
+            || (l.contains("senate") && l.contains("seat"));
+        let has_win = l.contains("win");
+        has_party && has_seat && has_win
+    }
+
+    /// 如：Democratic nominee for WV-02
+    fn is_candidate_nominee_proposition(l: &str) -> bool {
+        l.contains("nominee") || l.contains("nomination for") || l.contains(" nomination")
+    }
+
+    /// 明确名次/第二名等（与单纯「获胜」不同兑付）
+    fn has_explicit_placement_or_rank(l: &str) -> bool {
+        if l.contains("finish 2nd")
+            || l.contains("finish second")
+            || l.contains("finishes 2nd")
+            || l.contains("finishes second")
+            || l.contains("2nd place")
+            || l.contains("second place")
+            || l.contains("finish 3rd")
+            || l.contains("finish third")
+            || l.contains("3rd place")
+            || l.contains("third place")
+            || l.contains("runner-up")
+            || l.contains("runner up")
+            || l.contains("comes in second")
+            || l.contains("come in second")
+        {
+            return true;
+        }
+        ELECTORAL_NTH_PLACE_RE.is_match(l)
+    }
+
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_l = pm_title.to_lowercase();
+        let ks_l = kalshi_title.to_lowercase();
+
+        if !Self::looks_political_election_context(&pm_l) || !Self::looks_political_election_context(&ks_l) {
+            return true;
+        }
+
+        let pm_party_seat = Self::is_party_wins_seat_proposition(&pm_l);
+        let ks_party_seat = Self::is_party_wins_seat_proposition(&ks_l);
+        let pm_nom = Self::is_candidate_nominee_proposition(&pm_l);
+        let ks_nom = Self::is_candidate_nominee_proposition(&ks_l);
+        if (pm_party_seat && ks_nom) || (ks_party_seat && pm_nom) {
+            return false;
+        }
+
+        let pm_rank = Self::has_explicit_placement_or_rank(&pm_l);
+        let ks_rank = Self::has_explicit_placement_or_rank(&ks_l);
+        if pm_rank != ks_rank {
+            return false;
+        }
+
+        true
+    }
+}
+
 /// ==================== 主验证管道 ====================
 pub struct ValidationPipeline {
     date_validator: DateValidator,
@@ -1339,7 +1450,7 @@ impl ValidationPipeline {
             retained_samples: HashMap::new(),
         }
     }
-    
+
     pub fn validate(&mut self, pm_title: &str, kalshi_title: &str, similarity: f64, category: &str) -> Option<MatchInfo> {
         // 0. 垃圾市场检测
         if GarbageMarketDetector::is_garbage_sports_market(pm_title) ||
@@ -1445,7 +1556,13 @@ impl ValidationPipeline {
             self.record_filter(pm_title, kalshi_title, "抛硬币/掷币与赛果命题不一致");
             return None;
         }
-        
+
+        // 1.9 选举命题：政党赢席 vs 初选提名；名次(如第二名) vs 单纯获胜
+        if !ElectoralPropositionValidator::allows_pair(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "选举命题类型不一致(党席/提名或名次/获胜)");
+            return None;
+        }
+
         // 2. 尝试胜负市场匹配
         if let Some((pm_side, kalshi_side, needs_inversion)) = WinnerMarketValidator::validate(pm_title, kalshi_title) {
             let match_info = MatchInfo {
@@ -1641,6 +1758,19 @@ mod tests {
         assert!(result.2);
     }
 
+    /// PM 队2 带「 - 联赛/分组」时，不能用 strip 冒号误伤；Kalshi 问第二队须判颠倒 (YES,YES)
+    #[test]
+    fn test_winner_valorant_pm_suffix_kalshi_second_team_inversion() {
+        let r = WinnerMarketValidator::validate(
+            "Valorant: S2G Esports vs Mandatory (BO3) - VCL EMEA: Group D",
+            "Will Mandatory win the Mandatory vs. S2G Esports Valorant match? - Mandatory",
+        )
+        .expect("两队应一致且 Mandatory 为 PM 第二队，须走胜负校验");
+        assert_eq!(r.0, "YES");
+        assert_eq!(r.1, "YES");
+        assert!(r.2, "Kalshi 问 PM 队2 胜应为 2Y 颠倒");
+    }
+
     #[test]
     fn test_winner_tennis_wrong_opponent_rejected() {
         assert!(WinnerMarketValidator::validate(
@@ -1679,6 +1809,41 @@ mod tests {
         assert!(TossVsMatchMarketValidator::allows_pair(
             "Team A vs Team B - Who wins the toss?",
             "Team A vs Team B - Who wins the toss?"
+        ));
+    }
+
+    /// 政党赢大选议席 vs 初选/某人获政党提名 — 不得互配
+    #[test]
+    fn test_electoral_party_seat_vs_nominee_rejected() {
+        assert!(!ElectoralPropositionValidator::allows_pair(
+            "Will the Democratic Party win the WV-02 House seat?",
+            "Will Ace Parsi be the Democratic nominee for WV-02? - Yes",
+        ));
+        assert!(!ElectoralPropositionValidator::allows_pair(
+            "Will Ace Parsi be the Democratic nominee for WV-02?",
+            "Will the Republican Party win the WV-02 House seat? - Yes",
+        ));
+    }
+
+    /// 单纯「获胜/特别选举」vs 「第二名/名次」— 不得互配
+    #[test]
+    fn test_electoral_win_vs_second_place_rejected() {
+        assert!(!ElectoralPropositionValidator::allows_pair(
+            "Will Clayton Fuller win the GA-14 special election?",
+            "Will Clayton Fuller finish 2nd in the Georgia 14th congressional district Republican primary? - Yes",
+        ));
+    }
+
+    /// 非选举语境不受本规则影响；同类型（均无名次）仍放行
+    #[test]
+    fn test_electoral_non_political_and_same_shape_allowed() {
+        assert!(ElectoralPropositionValidator::allows_pair(
+            "Lakers vs Celtics",
+            "Lakers vs Celtics Winner? - Lakers",
+        ));
+        assert!(ElectoralPropositionValidator::allows_pair(
+            "Will Alice win the GA-14 special election?",
+            "Will Bob win the GA-14 special election? - Bob",
         ));
     }
 

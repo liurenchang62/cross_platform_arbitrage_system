@@ -11,6 +11,75 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 /// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）为主；仅日历日时有 `endDateIso`。
+/// 从 Gamma 单条 `market` JSON 解析 `Market`（用于 `/markets?id=` 等）；已关闭/已结算返回 `None`。
+pub(crate) fn parse_polymarket_gamma_market_row(
+    market_data: &Value,
+    category: Option<String>,
+    tags: Vec<String>,
+) -> Option<Market> {
+    let is_closed = market_data["closed"].as_bool().unwrap_or(true);
+    let is_resolved = market_data["umaResolutionStatus"].as_str() == Some("resolved");
+    if is_closed || is_resolved {
+        return None;
+    }
+
+    let market_id = market_data["id"].as_str().unwrap_or_default().to_string();
+    if market_id.is_empty() {
+        return None;
+    }
+    let question = market_data["question"].as_str().unwrap_or_default().to_string();
+
+    let mut yes_price = 0.0;
+    let mut no_price = 0.0;
+    if let Some(prices_str) = market_data["outcomePrices"].as_str() {
+        if let Ok(prices) = serde_json::from_str::<Vec<String>>(prices_str) {
+            if prices.len() >= 2 {
+                if let (Ok(yes), Ok(no)) = (prices[0].parse::<f64>(), prices[1].parse::<f64>()) {
+                    yes_price = yes;
+                    no_price = no;
+                }
+            }
+        }
+    }
+
+    let best_ask = market_data["bestAsk"].as_f64();
+    let best_bid = market_data["bestBid"].as_f64();
+    let last_trade_price = market_data["lastTradePrice"].as_f64();
+
+    let volume_24h = market_data["volume24hr"].as_f64().unwrap_or(0.0);
+
+    let mut token_ids = Vec::new();
+    if let Some(token_ids_str) = market_data["clobTokenIds"].as_str() {
+        if let Ok(ids) = serde_json::from_str::<Vec<String>>(token_ids_str) {
+            token_ids = ids;
+        }
+    }
+
+    let resolution_date = parse_polymarket_market_resolution_date(market_data);
+
+    Some(Market {
+        platform: "polymarket".to_string(),
+        market_id,
+        title: question,
+        description: market_data["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        resolution_date,
+        category,
+        tags,
+        slug: market_data["slug"].as_str().map(|s| s.to_string()),
+        token_ids,
+        outcome_prices: Some((yes_price, no_price)),
+        best_ask,
+        best_bid,
+        last_trade_price,
+        vector_cache: None,
+        categories: Vec::new(),
+        volume_24h,
+    })
+}
+
 pub(crate) fn parse_polymarket_market_resolution_date(market_data: &Value) -> Option<DateTime<Utc>> {
     for key in ["endDate", "end_date"] {
         if let Some(s) = market_data[key].as_str() {
@@ -97,6 +166,12 @@ impl PriceCache {
             prices,
             timestamp: Instant::now(),
         });
+    }
+
+    /// 清空缓存（用于追踪周期边界：与 wall-clock TTL 解耦，每周期重新拉价）
+    async fn clear(&self) {
+        let mut entries = self.entries.write().await;
+        entries.clear();
     }
 }
 
@@ -272,65 +347,13 @@ impl PolymarketClient {
 
                 if let Some(event_markets) = event_data["markets"].as_array() {
                     for market_data in event_markets {
-                        // 过滤已关闭或已结算的市场
-                        let is_closed = market_data["closed"].as_bool().unwrap_or(true);
-                        let is_resolved = market_data["umaResolutionStatus"].as_str() == Some("resolved");
-                        
-                        if is_closed || is_resolved {
-                            continue;
+                        if let Some(market) = parse_polymarket_gamma_market_row(
+                            market_data,
+                            category.clone(),
+                            tags.clone(),
+                        ) {
+                            markets.push(market);
                         }
-
-                        let market_id = market_data["id"].as_str().unwrap_or_default().to_string();
-                        let question = market_data["question"].as_str().unwrap_or_default().to_string();
-                        
-                        let mut yes_price = 0.0;
-                        let mut no_price = 0.0;
-                        if let Some(prices_str) = market_data["outcomePrices"].as_str() {
-                            if let Ok(prices) = serde_json::from_str::<Vec<String>>(prices_str) {
-                                if prices.len() >= 2 {
-                                    if let (Ok(yes), Ok(no)) = (prices[0].parse::<f64>(), prices[1].parse::<f64>()) {
-                                        yes_price = yes;
-                                        no_price = no;
-                                    }
-                                }
-                            }
-                        }
-
-                        let best_ask = market_data["bestAsk"].as_f64();
-                        let best_bid = market_data["bestBid"].as_f64();
-                        let last_trade_price = market_data["lastTradePrice"].as_f64();
-                        
-                        let volume_24h = market_data["volume24hr"].as_f64().unwrap_or(0.0);
-
-                        let mut token_ids = Vec::new();
-                        if let Some(token_ids_str) = market_data["clobTokenIds"].as_str() {
-                            if let Ok(ids) = serde_json::from_str::<Vec<String>>(token_ids_str) {
-                                token_ids = ids;
-                            }
-                        }
-
-                        let resolution_date = parse_polymarket_market_resolution_date(market_data);
-
-                        let market = Market {
-                            platform: "polymarket".to_string(),
-                            market_id,
-                            title: question,
-                            description: market_data["description"].as_str().unwrap_or_default().to_string(),
-                            resolution_date,
-                            category: category.clone(),
-                            tags: tags.clone(),
-                            slug: market_data["slug"].as_str().map(|s| s.to_string()),
-                            token_ids,
-                            outcome_prices: Some((yes_price, no_price)),
-                            best_ask,
-                            best_bid,
-                            last_trade_price,
-                            vector_cache: None,
-                            categories: Vec::new(),
-                            volume_24h,
-                        };
-
-                        markets.push(market);
                     }
                 }
             }
@@ -369,6 +392,36 @@ impl PolymarketClient {
 
         self.price_cache.set(market.market_id.clone(), prices.clone()).await;
         Ok(prices)
+    }
+
+    /// 追踪周期边界：清空 Polymarket 价格内存缓存，使本周期内 `fetch_prices` 按周期重新计算（与 60s TTL 解耦）。
+    pub async fn clear_price_cache(&self) {
+        self.price_cache.clear().await;
+    }
+
+    /// Gamma `GET /markets?id=...&limit=1`：拉取单市场快照（用于追踪周期刷新 outcome/bestAsk 等，与全量列表同源）。
+    pub async fn fetch_market_snapshot_by_id(&self, market_id: &str) -> Result<Market> {
+        if market_id.is_empty() {
+            anyhow::bail!("empty polymarket market_id");
+        }
+        let url = format!("{}/markets", Self::GAMMA_API_BASE);
+        let response = self
+            .http_client
+            .get(&url)
+            .query(&[("id", market_id), ("limit", "1")])
+            .send()
+            .await
+            .context("Failed to fetch Polymarket market by id")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Gamma API error: {}", response.status());
+        }
+        let arr: Vec<Value> = response.json().await?;
+        let market_data = arr
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Polymarket market not found: {}", market_id))?;
+        parse_polymarket_gamma_market_row(market_data, None, Vec::new()).ok_or_else(|| {
+            anyhow::anyhow!("Polymarket market closed or unparsable: {}", market_id)
+        })
     }
 
     /// Gamma `GET /markets?id=...&limit=1`：补全 `Market.resolution_date`（线上响应为 JSON 数组）
@@ -738,6 +791,11 @@ impl KalshiClient {
         }
         
         Ok(None)
+    }
+
+    /// 追踪周期边界：清空 Kalshi 价格内存缓存，使本周期内 `get_market_prices` 重新请求 API（与 60s TTL 解耦）。
+    pub async fn clear_price_cache(&self) {
+        self.price_cache.clear().await;
     }
 
     /// `GET /markets/{ticker}`，从响应 `market` 对象解析到期日

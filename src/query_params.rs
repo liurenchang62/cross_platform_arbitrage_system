@@ -16,14 +16,14 @@ pub const RETRY_INITIAL_DELAY_MS: u64 = 1000;
 pub const POLYMARKET_PAGE_LIMIT: u32 = 200;
 
 /// Polymarket 最大获取市场数
-pub const POLYMARKET_MAX_MARKETS: usize = 15000;
+pub const POLYMARKET_MAX_MARKETS: usize = 20000;
 
 // ==================== Kalshi 参数 ====================
 /// Kalshi 每页市场数
 pub const KALSHI_PAGE_LIMIT: u32 = 1000;
 
 /// Kalshi 最大获取市场数
-pub const KALSHI_MAX_MARKETS: usize = 15000;
+pub const KALSHI_MAX_MARKETS: usize = 20000;
 
 // ==================== 向量化参数 ====================
 /// 最大词汇表大小（降维用）
@@ -35,4 +35,4 @@ pub const MAX_VOCAB_SIZE: Option<usize> = None;
 pub const SIMILARITY_THRESHOLD: f64 = 0.8;
 
 /// 全量获取周期（每 N 个追踪周期执行一次全量获取）
-pub const FULL_FETCH_INTERVAL: usize = 720;
+pub const FULL_FETCH_INTERVAL: usize = 180;

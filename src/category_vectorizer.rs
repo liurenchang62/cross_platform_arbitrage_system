@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use anyhow::Result;
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::text_vectorizer::{TextVectorizer, VectorizerConfig};
@@ -26,6 +27,16 @@ impl CategoryVectorizer {
             vectorizer,
             index,
             fitted: false,
+        }
+    }
+
+    /// 从已训练好的 `TextVectorizer` 构造（用于并行建索引，与 `fit` 后状态一致）
+    pub fn with_fitted_vectorizer(category: String, vectorizer: TextVectorizer) -> Self {
+        Self {
+            category: category.clone(),
+            vectorizer,
+            index: VectorIndex::default(category),
+            fitted: true,
         }
     }
     
@@ -123,18 +134,38 @@ impl CategoryVectorizerManager {
     
     pub fn fit_all(&mut self, markets_by_category: HashMap<String, Vec<String>>) {
         let total = markets_by_category.len();
-        let mut processed = 0;
-        
-        for (category, titles) in markets_by_category {
-            processed += 1;
-            // 每5个类别输出一次进度
-            if processed % 5 == 0 || processed == 1 {
-                println!("      拟合进度: {}/{} 个类别", processed, total);
+        if total == 0 {
+            return;
+        }
+        println!("      并行拟合 {} 个类别 (rayon)...", total);
+
+        let mut pairs: Vec<(String, Vec<String>)> = markets_by_category.into_iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let fitted: Vec<(String, CategoryVectorizer)> = pairs
+            .into_par_iter()
+            .map(|(category, titles)| {
+                let mut cv = CategoryVectorizer::new(category.clone());
+                cv.fit(&titles);
+                (category, cv)
+            })
+            .collect();
+
+        for (category, cv) in fitted {
+            if category == "unclassified" {
+                self.unclassified_vectorizer = cv;
+            } else {
+                self.vectorizers.insert(category, cv);
             }
-            
-            if let Some(vectorizer) = self.get_or_create(&category) {
-                vectorizer.fit(&titles);
-            }
+        }
+    }
+
+    /// 将并行构建好的类别向量化器写回（仅替换对应键）
+    pub fn insert_built_category(&mut self, category: String, cv: CategoryVectorizer) {
+        if category == "unclassified" {
+            self.unclassified_vectorizer = cv;
+        } else {
+            self.vectorizers.insert(category, cv);
         }
     }
     

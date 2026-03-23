@@ -5,12 +5,13 @@ use crate::market::Market;
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
 use crate::query_params::SIMILARITY_THRESHOLD;
-use crate::category_vectorizer::{CategoryVectorizerManager};
+use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
 use crate::text_vectorizer::VectorizerConfig;
 use crate::validation::ValidationPipeline;
+use rayon::prelude::*;
 use tokio::task;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
@@ -66,8 +67,8 @@ pub struct MarketMatcher {
     pub kalshi_vectorizers: Arc<CategoryVectorizerManager>,
     pub polymarket_vectorizers: Arc<CategoryVectorizerManager>,
     pub fitted: bool,
-    kalshi_market_cache: Arc<HashMap<String, Market>>,
-    polymarket_market_cache: Arc<HashMap<String, Market>>,
+    kalshi_market_cache: Arc<HashMap<String, Arc<Market>>>,
+    polymarket_market_cache: Arc<HashMap<String, Arc<Market>>>,
     pub validation_pipeline: ValidationPipeline,
 }
 
@@ -89,6 +90,43 @@ impl MarketMatcher {
     pub fn with_logger(mut self, logger: UnclassifiedLogger) -> Self {
         self.unclassified_logger = Some(logger);
         self
+    }
+
+    /// 按类别并行建索引：与串行逐类 `add_markets_batch` 数学上等价，不改变近邻与匹配结果。
+    fn parallel_build_category_indices(
+        manager: &mut CategoryVectorizerManager,
+        by_category: HashMap<String, Vec<(String, String, Option<Value>)>>,
+    ) -> Result<(), anyhow::Error> {
+        let n_cat = by_category.len();
+        if n_cat == 0 {
+            return Ok(());
+        }
+        println!("      并行构建 {} 个类别索引 (rayon)...", n_cat);
+
+        let mut tasks = Vec::new();
+        for (category, items) in by_category {
+            let Some(cv) = manager.get(&category) else {
+                continue;
+            };
+            if !cv.fitted {
+                continue;
+            }
+            tasks.push((category, items, cv.vectorizer.clone()));
+        }
+
+        let built: Vec<(String, CategoryVectorizer)> = tasks
+            .into_par_iter()
+            .map(|(category, items, vz)| -> anyhow::Result<(String, CategoryVectorizer)> {
+                let mut cv = CategoryVectorizer::with_fitted_vectorizer(category.clone(), vz);
+                cv.add_markets_batch(items)?;
+                Ok((category, cv))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        for (cat, cv) in built {
+            manager.insert_built_category(cat, cv);
+        }
+        Ok(())
     }
 
     pub fn fit_vectorizer(&mut self, kalshi_markets: &[Market], polymarket_markets: &[Market]) -> Result<()> {
@@ -142,7 +180,7 @@ impl MarketMatcher {
         
         for market in markets {
             let market_id = format!("{}:{}", market.platform, market.market_id);
-            cache.insert(market_id.clone(), market.clone());
+            cache.insert(market_id.clone(), Arc::new(market.clone()));
             
             let categories = self.category_mapper.classify(&market.title);
             let data = Some(serde_json::json!({
@@ -174,11 +212,7 @@ impl MarketMatcher {
         self.kalshi_market_cache = Arc::new(cache);
         
         let kalshi_vec = Arc::get_mut(&mut self.kalshi_vectorizers).unwrap();
-        for (category, items) in by_category {
-            if let Some(vectorizer) = kalshi_vec.get_or_create(&category) {
-                vectorizer.add_markets_batch(items)?;
-            }
-        }
+        Self::parallel_build_category_indices(kalshi_vec, by_category)?;
         
         println!("   ✅ Kalshi 索引构建完成，总市场数: {}", kalshi_vec.total_size());
         Ok(())
@@ -196,7 +230,7 @@ impl MarketMatcher {
         
         for market in markets {
             let market_id = format!("{}:{}", market.platform, market.market_id);
-            cache.insert(market_id.clone(), market.clone());
+            cache.insert(market_id.clone(), Arc::new(market.clone()));
             
             let categories = self.category_mapper.classify(&market.title);
             let data = Some(serde_json::json!({
@@ -227,11 +261,7 @@ impl MarketMatcher {
         self.polymarket_market_cache = Arc::new(cache);
         
         let polymarket_vec = Arc::get_mut(&mut self.polymarket_vectorizers).unwrap();
-        for (category, items) in by_category {
-            if let Some(vectorizer) = polymarket_vec.get_or_create(&category) {
-                vectorizer.add_markets_batch(items)?;
-            }
-        }
+        Self::parallel_build_category_indices(polymarket_vec, by_category)?;
         
         println!("   ✅ Polymarket 索引构建完成，总市场数: {}", polymarket_vec.total_size());
         Ok(())
@@ -285,31 +315,25 @@ impl MarketMatcher {
         
         // 使用 spawn_blocking 保证 CPU 密集的匹配循环真并行，不阻塞 async worker
         let handle1 = task::spawn_blocking(move || {
-            let mut pipeline = ValidationPipeline::new();
-            let matches = Self::find_matches_directional_sync(
+            Self::find_matches_directional_sync(
                 &pm_markets_vec,
-                &kalshi_vec,
+                kalshi_vec.as_ref(),
                 &category_mapper1,
                 &config1,
-                &market_cache1,
-                &mut pipeline,
+                market_cache1.as_ref(),
                 "PM→Kalshi",
-            );
-            (matches, pipeline)
+            )
         });
-        
+
         let handle2 = task::spawn_blocking(move || {
-            let mut pipeline = ValidationPipeline::new();
-            let matches = Self::find_matches_directional_sync(
+            Self::find_matches_directional_sync(
                 &kalshi_markets_vec,
-                &polymarket_vec,
+                polymarket_vec.as_ref(),
                 &category_mapper2,
                 &config2,
-                &market_cache2,
-                &mut pipeline,
+                market_cache2.as_ref(),
                 "Kalshi→PM",
-            );
-            (matches, pipeline)
+            )
         });
         
         let (res1, res2) = tokio::join!(handle1, handle2);
@@ -383,23 +407,24 @@ impl MarketMatcher {
 
 
 
-    /// 同步版本：供 spawn_blocking 使用，实现真并行
+    /// 同步版本：供 spawn_blocking 使用。方向内顺序遍历（避免与另一方向的 `spawn_blocking` 叠加抢占全局 Rayon 池导致长时间无响应）。
     fn find_matches_directional_sync(
         query_markets: &[Market],
         target_vectorizers: &CategoryVectorizerManager,
         category_mapper: &CategoryMapper,
         config: &MarketMatcherConfig,
-        target_market_cache: &HashMap<String, Market>,
-        validation_pipeline: &mut ValidationPipeline,
+        target_market_cache: &HashMap<String, Arc<Market>>,
         direction_label: &str,
-    ) -> Vec<(Market, Market, f64, String, String, bool)> {
+    ) -> (
+        Vec<(Market, Market, f64, String, String, bool)>,
+        ValidationPipeline,
+    ) {
         Self::find_matches_directional_internal_impl(
             query_markets,
             target_vectorizers,
             category_mapper,
             config,
             target_market_cache,
-            validation_pipeline,
             direction_label,
         )
     }
@@ -409,29 +434,41 @@ impl MarketMatcher {
         target_vectorizers: &CategoryVectorizerManager,
         category_mapper: &CategoryMapper,
         config: &MarketMatcherConfig,
-        target_market_cache: &HashMap<String, Market>,
-        validation_pipeline: &mut ValidationPipeline,
+        target_market_cache: &HashMap<String, Arc<Market>>,
         direction_label: &str,
-    ) -> Vec<(Market, Market, f64, String, String, bool)> {
-        let mut all_matches = Vec::new();
+    ) -> (
+        Vec<(Market, Market, f64, String, String, bool)>,
+        ValidationPipeline,
+    ) {
         let total = query_markets.len();
-        
         println!("      🔍 匹配 {} 个市场 [{}]...", total, direction_label);
         let start_time = std::time::Instant::now();
-        
+
+        let is_kalshi_pm = direction_label == "Kalshi→PM";
+
+        let mut validation_pipeline = ValidationPipeline::new();
+        let mut all_arc: Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool)> = Vec::new();
+
         for (idx, query_market) in query_markets.iter().enumerate() {
             if idx > 0 && idx % 1000 == 0 {
                 let elapsed = start_time.elapsed();
                 let avg_time = elapsed.as_millis() as f64 / idx as f64;
                 let remaining = (total - idx) as f64 * avg_time;
-                println!("        进度: {}/{} 个市场 [{}], 已用 {:?}, 预计剩余 {:?}", 
-                    idx, total, direction_label,
+                println!(
+                    "        进度: {}/{} 个市场 [{}], 已用 {:?}, 预计剩余 {:?}",
+                    idx,
+                    total,
+                    direction_label,
                     humantime::format_duration(elapsed),
-                    humantime::format_duration(std::time::Duration::from_millis(remaining as u64)));
+                    humantime::format_duration(std::time::Duration::from_millis(remaining as u64)),
+                );
             }
-            
+
+            let query_arc = Arc::new(query_market.clone());
+            let query_full_id = format!("{}:{}", query_market.platform, query_market.market_id);
+            let mut seen_qt: HashSet<(String, String)> = HashSet::new();
+
             let query_categories = category_mapper.classify(&query_market.title);
-            
             for category in query_categories {
                 if let Some(vectorizer) = target_vectorizers.get(&category) {
                     let similar = vectorizer.find_similar(
@@ -439,14 +476,16 @@ impl MarketMatcher {
                         config.similarity_threshold,
                         5,
                     );
-                    
+
                     for (item, similarity) in similar {
-                        if let Some(target_market) = target_market_cache.get(&item.id) {
-                            // 二筛始终需要 (pm_title, kalshi_title)；Kalshi→PM 方向时 query=Kalshi target=PM，需交换
-                            let (pm_title, kalshi_title) = if direction_label == "Kalshi→PM" {
-                                (&target_market.title, &query_market.title)
+                        if let Some(target_arc) = target_market_cache.get(&item.id) {
+                            if !seen_qt.insert((query_full_id.clone(), item.id.clone())) {
+                                continue;
+                            }
+                            let (pm_title, kalshi_title) = if is_kalshi_pm {
+                                (target_arc.title.as_str(), query_market.title.as_str())
                             } else {
-                                (&query_market.title, &target_market.title)
+                                (query_market.title.as_str(), target_arc.title.as_str())
                             };
                             if let Some(match_info) = validation_pipeline.validate(
                                 pm_title,
@@ -455,16 +494,16 @@ impl MarketMatcher {
                                 &category,
                             ) {
                                 let confidence = Self::calculate_confidence(
-                                    query_market,
-                                    target_market,
+                                    query_arc.as_ref(),
+                                    target_arc.as_ref(),
                                     similarity,
                                     config,
                                 );
-                                
+
                                 if confidence.overall_score >= config.similarity_threshold {
-                                    all_matches.push((
-                                        query_market.clone(),
-                                        target_market.clone(),
+                                    all_arc.push((
+                                        Arc::clone(&query_arc),
+                                        Arc::clone(target_arc),
                                         confidence.overall_score,
                                         match_info.pm_side,
                                         match_info.kalshi_side,
@@ -477,12 +516,21 @@ impl MarketMatcher {
                 }
             }
         }
-        
+
+        let all_matches: Vec<(Market, Market, f64, String, String, bool)> = all_arc
+            .into_iter()
+            .map(|(qa, ta, s, ps, ks, ni)| ((*qa).clone(), (*ta).clone(), s, ps, ks, ni))
+            .collect();
+
         let elapsed = start_time.elapsed();
-        println!("        匹配完成 [{}], 耗时: {:?}, 找到 {} 个匹配", 
-            direction_label, elapsed, all_matches.len());
-        
-        all_matches
+        println!(
+            "        匹配完成 [{}], 耗时: {:?}, 找到 {} 个匹配",
+            direction_label,
+            elapsed,
+            all_matches.len()
+        );
+
+        (all_matches, validation_pipeline)
     }
 
 
